@@ -1,15 +1,16 @@
 #
-#  FCHXHCIFix build (macOS / CI). Needs MacKernelSDK in the repository root (scripts/bootstrap.sh fetches it).
+#  FCHXHCIFix build (macOS / CI). Needs MacKernelSDK in the repository root:
 #
-#    make -C FCHXHCIFix               -> FCHXHCIFix/build/FCHXHCIFix.kext (+ zip)
+#    git clone --depth 1 https://github.com/acidanthera/MacKernelSDK
+#    make                             -> build/FCHXHCIFix.kext and build/FCHXHCIFix-<version>.zip
 #
 
 PRODUCT_NAME   := FCHXHCIFix
-MODULE_NAME    := com.carrizored.FCHXHCIFix
+MODULE_NAME    := io.github.cl0utm4n.FCHXHCIFix
 MODULE_VERSION := 1.0.0
 MIN_MACOS      := 11.0
 
-ROOT     := ..
+ROOT     := .
 KSDK     := $(ROOT)/MacKernelSDK
 BUILD    := build
 KEXT     := $(BUILD)/$(PRODUCT_NAME).kext
