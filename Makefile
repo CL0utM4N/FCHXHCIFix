@@ -6,7 +6,7 @@
 #
 
 PRODUCT_NAME   := FCHXHCIFix
-MODULE_NAME    := io.github.cl0utm4n.FCHXHCIFix
+MODULE_NAME    := com.carrizored.FCHXHCIFix
 MODULE_VERSION := 1.0.0
 MIN_MACOS      := 11.0
 
