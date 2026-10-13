@@ -14,7 +14,7 @@ FCHXHCIFix wakes Apple's USB interrupt handler itself every ~2.5 ms. With it, US
 
 It's a plain IOKit kext. It needs no Lilu or other dependencies, and it only attaches to `1022:7914`.
 
-It was found and written while bringing up **CarrizoRed**, a driver in development that makes Apple's AMD Polaris
+It was found and written while bringing up [**CarrizoRed**](https://github.com/CL0utM4N/CarrizoRed), a driver in development that makes Apple's AMD Polaris
 graphics drivers work on these APUs. FCHXHCIFix doesn't depend on CarrizoRed, and it's useful on any of these machines
 running macOS, whatever graphics setup they use.
 
