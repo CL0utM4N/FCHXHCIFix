@@ -16,6 +16,11 @@
 //  work loop exactly as a delivered interrupt would; the handler returns quickly when the event rings are empty.
 //  USBSTS.EINT is cleared (RW1C) when seen. The state is published in the controller's "FCHXHCIFix-state" property.
 //
+//  Sleep: AppleUSBXHCIPCI takes its interrupt source off the work loop around sleep and adds a new one on wake. The
+//  old source, still retained here, then has no work loop, and signalling it dereferenced null (panic in
+//  IOFilterInterruptEventSource::signalInterrupt after a wake). So the signalling runs inside the work loop's gate,
+//  only for sources still on its event chain, and the sources are collected again when they are gone.
+//
 //  Boot-args: -fchxhcioff      do nothing
 //             fchxhcimode=1    signal only when USBSTS.EINT is set (diagnosis; doesn't fix the D509BA)
 //
@@ -43,11 +48,12 @@ public:
 private:
 	static void forwardThread(void *arg, wait_result_t);
 	static IOReturn collectSources(OSObject *owner, void *loop, void *, void *, void *);
+	static IOReturn signalSources(OSObject *owner, void *loop, void *signalled, void *, void *);
 	void publish(const char *what);
 
 	IOPCIDevice *pci {nullptr};
 	IOFilterInterruptEventSource *sources[4] {};
-	uint32_t sourceCount {0}, forwards {0}, polls {0}, mode {2};
+	uint32_t sourceCount {0}, forwards {0}, polls {0}, mode {2}, recollects {0};
 	volatile bool stopping {false};
 };
 
@@ -92,8 +98,8 @@ void FCHXHCIFix::stop(IOService *provider) {
 
 void FCHXHCIFix::publish(const char *what) {
 	char state[160];
-	snprintf(state, sizeof(state), "%u sources, %u forwards, %u polls; %s", sourceCount,
-		__atomic_load_n(&forwards, __ATOMIC_RELAXED), __atomic_load_n(&polls, __ATOMIC_RELAXED), what);
+	snprintf(state, sizeof(state), "%u sources, %u forwards, %u polls, %u re-collected; %s", sourceCount,
+		__atomic_load_n(&forwards, __ATOMIC_RELAXED), __atomic_load_n(&polls, __ATOMIC_RELAXED), recollects, what);
 	pci->setProperty("FCHXHCIFix-state", state);
 }
 
@@ -112,9 +118,45 @@ IOReturn FCHXHCIFix::collectSources(OSObject *owner, void *arg, void *, void *, 
 	return kIOReturnSuccess;
 }
 
+// Inside the work loop's gate: drop the sources no longer on the loop's event chain (removed for sleep), collect the
+// current ones when none are left, and signal the enabled ones. *signalled = how many were signalled.
+IOReturn FCHXHCIFix::signalSources(OSObject *owner, void *arg, void *signalled, void *, void *) {
+	auto *self = static_cast<FCHXHCIFix *>(owner);
+	auto *loop = static_cast<IOWorkLoop *>(arg);
+	uint32_t kept = 0, count = 0;
+	for (uint32_t i = 0; i < self->sourceCount; i++) {
+		auto *source = self->sources[i];
+		bool onLoop = false;
+		for (auto *e = WorkLoopPeek::head(loop); e && !onLoop; e = EventSourcePeek::next(e))
+			onLoop = e == source;
+		if (onLoop)
+			self->sources[kept++] = source;
+		else
+			source->release();
+	}
+	for (uint32_t i = kept; i < self->sourceCount; i++)
+		self->sources[i] = nullptr;
+	self->sourceCount = kept;
+	if (!kept) {
+		collectSources(owner, loop, nullptr, nullptr, nullptr);
+		if (self->sourceCount)
+			self->recollects++;
+	}
+	for (uint32_t i = 0; i < self->sourceCount; i++) {
+		auto *source = self->sources[i];
+		if (source->getWorkLoop() == loop && source->isEnabled()) {
+			source->signalInterrupt();
+			count++;
+		}
+	}
+	*static_cast<uint32_t *>(signalled) = count;
+	return kIOReturnSuccess;
+}
+
 void FCHXHCIFix::forwardThread(void *arg, wait_result_t) {
 	auto *self = static_cast<FCHXHCIFix *>(arg);
 	IOService *driver = nullptr;
+	IOWorkLoop *loop = nullptr;
 	IOMemoryMap *map = nullptr;
 
 	// AppleUSBXHCIPCI attaches to the same controller in the default category; give it up to 5 min.
@@ -136,7 +178,8 @@ void FCHXHCIFix::forwardThread(void *arg, wait_result_t) {
 		self->publish("AppleUSBXHCIPCI never attached");
 		goto done;
 	}
-	if (auto *loop = driver->getWorkLoop()) {
+	loop = driver->getWorkLoop();
+	if (loop) {
 		// The source is added during start(); retry briefly if it isn't there yet.
 		for (int i = 0; i < 50 && !self->sourceCount && !self->stopping; i++) {
 			loop->runAction(collectSources, self, loop);
@@ -171,9 +214,10 @@ void FCHXHCIFix::forwardThread(void *arg, wait_result_t) {
 			if (eint)
 				*reinterpret_cast<volatile uint32_t *>(base + usbsts) = 8;
 			if (eint || self->mode >= 2) {
-				for (uint32_t i = 0; i < self->sourceCount; i++)
-					self->sources[i]->signalInterrupt();
-				__atomic_fetch_add(&self->forwards, 1, __ATOMIC_RELAXED);
+				uint32_t signalled = 0;
+				loop->runAction(signalSources, self, loop, &signalled);
+				if (signalled)
+					__atomic_fetch_add(&self->forwards, 1, __ATOMIC_RELAXED);
 			}
 			if (polls % 1000 == 1)
 				self->publish(self->mode >= 2 ? "running, mode 2 (every poll)" : "running, mode 1 (on EINT)");
