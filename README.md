@@ -68,7 +68,9 @@ ioreg -lw0 -r -c IOPCIDevice | grep FCHXHCIFix-state
 
 ## Tested
 
-- ASUS VivoBook 15 **D509BA** (A9-9425, Stoney Ridge), macOS Sequoia: 15.4 recovery and installer, and an installed 15.8.1.
+- ASUS VivoBook 15 **D509BA** (A9-9425, Stoney Ridge): installed macOS Ventura 13.7.8, Sonoma 14 and Sequoia 15.8.1, and
+  the Sequoia 15.4 recovery and installer. Monterey 12.5.1 needs the reset patch's `Limit` at 2048 (see *Reset timeout*
+  below); tested only up to that point so far.
 
 Only the D509BA has been tested so far. The controller, its revision and the APU's interrupt path are the same on all
 of the machines below, so they very likely behave the same. Reports from other machines are welcome: open an issue
@@ -166,8 +168,24 @@ on the D509BA:
   power through an SMI, and `_PS0` had to reload its firmware; macOS never got it back. An SSDT that clears the
   firmware's D3cold flag for the controller under macOS fixed it (the D509BA's DSDT calls it `XHCD`; names differ by
   vendor).
-- **Reset timeout.** `AppleUSBXHCI::reset()` waits only 100 ms for `USBCMD.HCRST`; this controller needs ~105 ms. An
-  OpenCore kernel patch raising it to 1000 ms fixed it.
+- **Reset timeout.** `AppleUSBXHCI::reset()` waits only 100 ms for `USBCMD.HCRST`; this controller needs ~105 ms, so
+  the driver gives up and powers the controller off (`reset failed` `0xe00002c9`, or `setPowerStateGated ... failed with
+  0xe00002e9`, then a USB installer that waits forever for its root device). An OpenCore kernel patch raising the wait
+  to 1000 ms fixes it. It replaces `mov edi, 100; mov esi, 1000000` (the `clock_interval_to_deadline` arguments) with
+  `mov edi, 1000`. In `config.plist`, `Kernel` → `Patch`:
+
+  | Key | Value |
+  |---|---|
+  | `Identifier` | `com.apple.driver.usb.AppleUSBXHCI` |
+  | `Base` | `__ZN12AppleUSBXHCI5resetEv` |
+  | `Find` | `BF64000000BE40420F00` |
+  | `Replace` | `BFE8030000BE40420F00` |
+  | `Count` | 1 |
+  | `Limit` | **2048** |
+  | `MinKernel` | `20.0.0` |
+
+  `Limit` matters: the bytes sit 571 bytes into `reset()` on Sequoia 15.8.1 but 1078 on Monterey 12.5.1, so a limit of
+  1024 silently skips Monterey's copy. There is one match in each version, so 2048 can't hit anything else.
 - **USB map.** As on any machine, map the ports (e.g. with a `USBMap.kext`).
 
 ## Building
