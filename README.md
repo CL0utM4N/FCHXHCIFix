@@ -43,7 +43,8 @@ Matisse `1022:149c`). Those controllers are not affected. FCHXHCIFix doesn't mat
 
 ## Install
 
-USB 3 on these machines needs the kext **and** an OpenCore kernel patch; an SSDT is needed only in one case.
+USB 3 on these machines needs the kext **and** an OpenCore kernel patch. Most of them also need two SSDTs, for a
+firmware problem that breaks USB in other ways (steps 5 and 6; see *Check your firmware* to be sure).
 
 1. Download `FCHXHCIFix-<version>.zip` from [Releases](../../releases) and unzip it.
 2. Copy `FCHXHCIFix.kext` to `EFI/OC/Kexts`.
@@ -68,14 +69,44 @@ USB 3 on these machines needs the kext **and** an OpenCore kernel patch; an SSDT
    | `Replace` | `BFE8030000BE40420F00` (data) |
 
    Leave `Mask`, `ReplaceMask` and `MaxKernel` empty and `Skip` at 0. Details in *Reset timeout* below.
-5. **Only if your config makes the firmware see Windows 8 or later** (an `SSDT-XOSI` with an `_OSI` → `XOSI` rename,
-   often added for an I²C trackpad or brightness keys): also add `SSDT-FCHXHCI.aml` from the zip to `EFI/OC/ACPI` and
-   to `config.plist` → ACPI → Add. In that mode the firmware power-gates the controller in a way macOS can't undo (see
-   *The firmware's xHCI D3cold path* below). It's harmless without such a rename and on firmware that doesn't have the
-   flag it clears.
+5. **If the firmware turns the HPET off under macOS** (it did on both machines checked so far; the symptoms are a
+   dead or flaky keyboard and USB, or a boot that only continues once a USB device is plugged in): make the firmware
+   see Windows 10. Add `SSDT-XOSI.aml` from the zip to `EFI/OC/ACPI` and `config.plist` → ACPI → Add, and this rename
+   to `config.plist` → ACPI → Patch:
+
+   | Key | Value |
+   |---|---|
+   | `Comment` | `_OSI to XOSI` |
+   | `Count` | `0` (every occurrence) |
+   | `Enabled` | `true` |
+   | `Find` | `5F4F5349` (data, `_OSI`) |
+   | `Replace` | `584F5349` (data, `XOSI`) |
+   | `TableSignature` | `44534454` (data, `DSDT`) |
+
+   Leave the other keys empty or 0. If your config already has an `SSDT-XOSI` and this rename (common for I²C
+   trackpads), keep yours instead.
+6. **Whenever the firmware sees Windows 8 or later** (step 5, or your own `SSDT-XOSI`): also add `SSDT-FCHXHCI.aml`
+   from the zip to `EFI/OC/ACPI` and `config.plist` → ACPI → Add. In that mode the firmware power-gates the USB 3
+   controller in a way macOS can't undo (see *The firmware's xHCI D3cold path* below). It's harmless without such a
+   rename, and does nothing on firmware that doesn't have the flag it clears.
 
 If you install macOS from a USB stick on one of these machines, put it in the EFI from the start: the installer reads
 everything over USB.
+
+## Check your firmware
+
+Steps 5 and 6 depend on the firmware's ACPI code, which on these machines is AMD's reference code with the same names.
+To check yours, dump the ACPI tables (OpenCore's `SysReport` quirk, or `sudo acpidump -b` on a Linux live USB) and
+disassemble `DSDT.aml` with `iasl -d DSDT.aml`. In `DSDT.dsl`, look for:
+
+- **The HPET** (`Device (HPET)`, `_HID` `PNP0103`): if its `_STA` only returns `0x0F` when an OS level is high enough
+  (e.g. `If ((OSTB >= 0x40))` on the Acer Aspire E5-523, `OSVR >= 0x0C` on the ASUS VivoBook 15 D509BA) and otherwise
+  clears `HPEN`, the HPET is off under macOS: you need step 5. That OS level comes from `_OSI ("Windows ...")` checks in a
+  method like `OSTP` or `OSFL`, which macOS fails.
+- **The USB 3 D3cold flag**: a field `XHCD` used by `XHC0._PS0`, `_PS3` and `_S0W` (with `FDDC (0x17, ...)` or `LXFW`
+  firmware reloads), and a start-up method (`FINI`, called from `\_SB.PCI0._INI`) that clears it only below some OS
+  level (`TPOS >= 0x60` on the Acer, `OSVR >= 0x0F` on the D509BA: Windows 8). With step 5's Windows 10, that flag stays
+  set: you need step 6. If your DSDT has the same code under other names, open an issue with your ACPI dump.
 
 ## Check that it's working
 
@@ -187,8 +218,12 @@ idle states, which may cost some battery life until the root cause is found.
 
 ## Other USB problems on these machines
 
-These aren't caused by the lost interrupts and FCHXHCIFix doesn't fix them, but they turned up on the same controller
-on the D509BA:
+These aren't caused by the lost interrupts and FCHXHCIFix doesn't fix them, but they turned up on the same machines:
+- **No HPET under macOS.** The firmware enables the HPET only for Windows Vista or later, and macOS answers only
+  `_OSI ("Darwin")`, so the HPET is reported disabled and its interrupts go back to the legacy timer. On the D509BA the
+  keyboard and USB were dead; the Acer Aspire E5-523 hung during boot until a USB device was plugged in, and USB 3 never
+  worked even with the reset patch. `SSDT-XOSI` (in the release zip, source `SSDT-XOSI.dsl`) and the `_OSI` → `XOSI`
+  rename make the firmware see Windows 10 (Install step 5).
 - **The firmware's xHCI D3cold path.** With the firmware in Windows 8+ mode (`_OSI`), `XHC0._PS3` cut the controller's
   power through an SMI, and `_PS0` had to reload its firmware; macOS never got it back. `SSDT-FCHXHCI` (in the release
   zip, source `SSDT-FCHXHCI.dsl`) clears that D3cold flag, `XHCD` in AMD's reference firmware, under macOS after the
