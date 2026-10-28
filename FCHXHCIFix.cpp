@@ -49,7 +49,9 @@ private:
 	static void forwardThread(void *arg, wait_result_t);
 	static IOReturn collectSources(OSObject *owner, void *loop, void *, void *, void *);
 	static IOReturn signalSources(OSObject *owner, void *loop, void *signalled, void *, void *);
+	static IOReturn listSources(OSObject *owner, void *loop, void *, void *, void *);
 	void publish(const char *what);
+	void fail(const char *what);
 
 	IOPCIDevice *pci {nullptr};
 	IOFilterInterruptEventSource *sources[4] {};
@@ -103,6 +105,13 @@ void FCHXHCIFix::publish(const char *what) {
 	pci->setProperty("FCHXHCIFix-state", state);
 }
 
+// Why it isn't forwarding, on the verbose screen too (the property can't be read during an install).
+void FCHXHCIFix::fail(const char *what) {
+	publish(what);
+	IOLog("FCHXHCIFix: not forwarding: %s
+", what);
+}
+
 // Collect the driver's filter interrupt sources on the controller, inside the work loop's gate.
 IOReturn FCHXHCIFix::collectSources(OSObject *owner, void *arg, void *, void *, void *) {
 	auto *self = static_cast<FCHXHCIFix *>(owner);
@@ -114,6 +123,19 @@ IOReturn FCHXHCIFix::collectSources(OSObject *owner, void *arg, void *, void *, 
 			filter->retain();
 			self->sources[self->sourceCount++] = filter;
 		}
+	}
+	return kIOReturnSuccess;
+}
+
+// The event sources on the work loop, for the log when none could be used.
+IOReturn FCHXHCIFix::listSources(OSObject *owner, void *arg, void *, void *, void *) {
+	auto *self = static_cast<FCHXHCIFix *>(owner);
+	auto *loop = static_cast<IOWorkLoop *>(arg);
+	for (auto *source = WorkLoopPeek::head(loop); source; source = EventSourcePeek::next(source)) {
+		auto *interrupt = OSDynamicCast(IOInterruptEventSource, source);
+		IOLog("FCHXHCIFix: work loop source %s%s
+", source->getMetaClass()->getClassName(),
+			interrupt ? (interrupt->getProvider() == self->pci ? " (on the controller)" : " (other provider)") : "");
 	}
 	return kIOReturnSuccess;
 }
@@ -175,25 +197,29 @@ void FCHXHCIFix::forwardThread(void *arg, wait_result_t) {
 			IOSleep(100);
 	}
 	if (!driver) {
-		self->publish("AppleUSBXHCIPCI never attached");
+		self->fail("AppleUSBXHCIPCI never attached");
 		goto done;
 	}
 	loop = driver->getWorkLoop();
 	if (loop) {
-		// The source is added during start(); retry briefly if it isn't there yet.
-		for (int i = 0; i < 50 && !self->sourceCount && !self->stopping; i++) {
+		// The source is added during start(), or later on some machines (Dell Inspiron 3475: no forwarding, and none of
+		// these states shown): keep looking for as long as for the driver.
+		for (int i = 0; i < 3000 && !self->sourceCount && !self->stopping; i++) {
 			loop->runAction(collectSources, self, loop);
 			if (!self->sourceCount)
 				IOSleep(100);
 		}
 	}
 	if (!self->sourceCount) {
-		self->publish("no interrupt source on AppleUSBXHCIPCI's work loop");
+		// What is on the loop instead (class, and whether its provider is the controller).
+		if (loop)
+			loop->runAction(listSources, self, loop);
+		self->fail("no interrupt source on AppleUSBXHCIPCI's work loop");
 		goto done;
 	}
 	map = self->pci->mapDeviceMemoryWithIndex(0);
 	if (!map) {
-		self->publish("BAR0 map FAILED");
+		self->fail("BAR0 map FAILED");
 		goto done;
 	}
 	IOLog("FCHXHCIFix: forwarding interrupts to AppleUSBXHCIPCI (%u sources, mode %u)\n", self->sourceCount, self->mode);
