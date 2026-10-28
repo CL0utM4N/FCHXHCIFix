@@ -9,7 +9,7 @@
 
 PRODUCT_NAME   := FCHXHCIFix
 MODULE_NAME    := com.carrizored.FCHXHCIFix
-MODULE_VERSION := 1.0.0
+MODULE_VERSION := 1.0.1
 MIN_MACOS      := 11.0
 
 ROOT     := .
