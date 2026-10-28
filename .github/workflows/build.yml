@@ -19,6 +19,9 @@ jobs:
       - name: Fetch MacKernelSDK
         run: git clone --depth 1 https://github.com/acidanthera/MacKernelSDK
 
+      - name: Install iasl
+        run: brew install acpica
+
       - name: Build
         run: make
 

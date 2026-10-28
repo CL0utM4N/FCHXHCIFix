@@ -43,11 +43,36 @@ Matisse `1022:149c`). Those controllers are not affected. FCHXHCIFix doesn't mat
 
 ## Install
 
+USB 3 on these machines needs the kext **and** an OpenCore kernel patch; an SSDT is needed only in one case.
+
 1. Download `FCHXHCIFix-<version>.zip` from [Releases](../../releases) and unzip it.
 2. Copy `FCHXHCIFix.kext` to `EFI/OC/Kexts`.
 3. Add it to `config.plist` → Kernel → Add (`BundlePath` `FCHXHCIFix.kext`, `ExecutablePath`
    `Contents/MacOS/FCHXHCIFix`, `PlistPath` `Contents/Info.plist`, `Enabled` true). It has no dependencies and can go in
    any position.
+4. **Required: the reset-timeout kernel patch.** macOS waits 100 ms for the controller to reset; it needs ~105 ms, so
+   without this patch macOS switches the controller off and USB 3 stays dead whatever the kext does. Add to
+   `config.plist` → Kernel → Patch:
+
+   | Key | Value |
+   |---|---|
+   | `Arch` | `x86_64` (or `Any`) |
+   | `Base` | `__ZN12AppleUSBXHCI5resetEv` |
+   | `Comment` | `AppleUSBXHCI reset() timeout 100 -> 1000 ms` |
+   | `Count` | `1` |
+   | `Enabled` | `true` |
+   | `Find` | `BF64000000BE40420F00` (data) |
+   | `Identifier` | `com.apple.driver.usb.AppleUSBXHCI` |
+   | `Limit` | `2048` |
+   | `MinKernel` | `20.0.0` |
+   | `Replace` | `BFE8030000BE40420F00` (data) |
+
+   Leave `Mask`, `ReplaceMask` and `MaxKernel` empty and `Skip` at 0. Details in *Reset timeout* below.
+5. **Only if your config makes the firmware see Windows 8 or later** (an `SSDT-XOSI` with an `_OSI` → `XOSI` rename,
+   often added for an I²C trackpad or brightness keys): also add `SSDT-FCHXHCI.aml` from the zip to `EFI/OC/ACPI` and
+   to `config.plist` → ACPI → Add. In that mode the firmware power-gates the controller in a way macOS can't undo (see
+   *The firmware's xHCI D3cold path* below). It's harmless without such a rename and on firmware that doesn't have the
+   flag it clears.
 
 If you install macOS from a USB stick on one of these machines, put it in the EFI from the start: the installer reads
 everything over USB.
@@ -165,9 +190,10 @@ idle states, which may cost some battery life until the root cause is found.
 These aren't caused by the lost interrupts and FCHXHCIFix doesn't fix them, but they turned up on the same controller
 on the D509BA:
 - **The firmware's xHCI D3cold path.** With the firmware in Windows 8+ mode (`_OSI`), `XHC0._PS3` cut the controller's
-  power through an SMI, and `_PS0` had to reload its firmware; macOS never got it back. An SSDT that clears the
-  firmware's D3cold flag for the controller under macOS fixed it (the D509BA's DSDT calls it `XHCD`; names differ by
-  vendor).
+  power through an SMI, and `_PS0` had to reload its firmware; macOS never got it back. `SSDT-FCHXHCI` (in the release
+  zip, source `SSDT-FCHXHCI.dsl`) clears that D3cold flag, `XHCD` in AMD's reference firmware, under macOS after the
+  firmware's start-up code has set it. If your firmware names it differently, it does nothing: open an issue with an
+  ACPI dump.
 - **Reset timeout.** `AppleUSBXHCI::reset()` waits only 100 ms for `USBCMD.HCRST`; this controller needs ~105 ms, so
   the driver gives up and powers the controller off (`reset failed` `0xe00002c9`, or `setPowerStateGated ... failed with
   0xe00002e9`, then a USB installer that waits forever for its root device). An OpenCore kernel patch raising the wait

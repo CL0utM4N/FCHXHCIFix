@@ -2,7 +2,9 @@
 #  FCHXHCIFix build (macOS / CI). Needs MacKernelSDK in the repository root:
 #
 #    git clone --depth 1 https://github.com/acidanthera/MacKernelSDK
-#    make                             -> build/FCHXHCIFix.kext and build/FCHXHCIFix-<version>.zip
+#    make                             -> build/FCHXHCIFix.kext, build/SSDT-FCHXHCI.aml and build/FCHXHCIFix-<version>.zip
+#
+#  The SSDT needs iasl (brew install acpica).
 #
 
 PRODUCT_NAME   := FCHXHCIFix
@@ -41,8 +43,11 @@ $(KEXT)/Contents/Info.plist: Info.plist.in Makefile
 	sed -e 's/@MODULE_NAME@/$(MODULE_NAME)/g' -e 's/@MODULE_VERSION@/$(MODULE_VERSION)/g' $< > $@
 	plutil -lint $@
 
-$(BUILD)/$(PRODUCT_NAME)-$(MODULE_VERSION).zip: $(BINARY) $(KEXT)/Contents/Info.plist
-	cd $(BUILD) && rm -f $(notdir $@) && zip -qr $(notdir $@) $(PRODUCT_NAME).kext
+$(BUILD)/SSDT-FCHXHCI.aml: SSDT-FCHXHCI.dsl | $(BUILD)
+	iasl -p $(basename $@) $<
+
+$(BUILD)/$(PRODUCT_NAME)-$(MODULE_VERSION).zip: $(BINARY) $(KEXT)/Contents/Info.plist $(BUILD)/SSDT-FCHXHCI.aml
+	cd $(BUILD) && rm -f $(notdir $@) && zip -qr $(notdir $@) $(PRODUCT_NAME).kext SSDT-FCHXHCI.aml
 
 $(BUILD):
 	@mkdir -p $@
