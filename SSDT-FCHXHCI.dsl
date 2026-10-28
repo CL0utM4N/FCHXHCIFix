@@ -1,5 +1,5 @@
 /*
- * SSDT-FCHXHCI: keep the AMD FCH xHCI (1022:7914) out of the firmware's D3cold power-gating under macOS.
+ * SSDT-FCHXHCI: keep the AMD FCH USB controllers (xHCI 1022:7914, EHCI) out of the firmware's D3cold power-gating under macOS.
  *
  * AMD's reference firmware for these APUs has a flag, XHCD, that arms D3cold for the xHCI. When it's set, XHC0._PS3
  * cuts the controller's power through an SMI and _PS0 has to reload the controller's firmware through another SMI;
@@ -8,14 +8,19 @@
  * which happens under macOS when an SSDT-XOSI / _OSI rename makes the firmware see Windows (for an I2C trackpad,
  * brightness keys, ...). Without such a rename XHCD is already clear and this SSDT changes nothing.
  *
- * FXHC clears XHCD again under macOS. Its _INI runs after \_SB.PCI0._INI because ACPI runs a parent's _INI before its
- * children's. Machines whose firmware has no XHCD are left alone (CondRefOf). Found on the ASUS VivoBook 15 D509BA.
+ * The FCH's EHCI (USB 2) controller has the same flag, EHCD, and the same SMI power-off in EHC1._PS3; FINI leaves it set
+ * in Windows 8+ mode too. On the ASUS VivoBook 15 D509BA EHCI happened to survive it; on a Dell Inspiron 3475 AIO the USB
+ * 2 ports were dead. So EHCD is cleared as well.
+ *
+ * FXHC clears XHCD and EHCD again under macOS. Its _INI runs after \_SB.PCI0._INI because ACPI runs a parent's _INI
+ * before its children's. Firmware without these flags is left alone (CondRefOf).
  *
  * Compile: iasl SSDT-FCHXHCI.dsl
  */
 DefinitionBlock ("", "SSDT", 2, "FCHXHC", "FCHXHCI", 0x00001000)
 {
     External (\XHCD, FieldUnitObj)
+    External (\EHCD, FieldUnitObj)
     External (\_SB.PCI0, DeviceObj)
 
     Scope (\_SB.PCI0)
@@ -28,6 +33,11 @@ DefinitionBlock ("", "SSDT", 2, "FCHXHC", "FCHXHCI", 0x00001000)
                 If (CondRefOf (\XHCD))
                 {
                     \XHCD = Zero
+                }
+
+                If (CondRefOf (\EHCD))
+                {
+                    \EHCD = Zero
                 }
             }
 

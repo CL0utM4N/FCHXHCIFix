@@ -227,7 +227,8 @@ These aren't caused by the lost interrupts and FCHXHCIFix doesn't fix them, but 
 - **The firmware's xHCI D3cold path.** With the firmware in Windows 8+ mode (`_OSI`), `XHC0._PS3` cut the controller's
   power through an SMI, and `_PS0` had to reload its firmware; macOS never got it back. `SSDT-FCHXHCI` (in the release
   zip, source `SSDT-FCHXHCI.dsl`) clears that D3cold flag, `XHCD` in AMD's reference firmware, under macOS after the
-  firmware's start-up code has set it. If your firmware names it differently, it does nothing: open an issue with an
+  firmware's start-up code has set it, and its USB 2 (EHCI) twin `EHCD`, which left a Dell Inspiron 3475's USB 2 ports
+  dead. If your firmware names it differently, it does nothing: open an issue with an
   ACPI dump.
 - **Reset timeout.** `AppleUSBXHCI::reset()` waits only 100 ms for `USBCMD.HCRST`; this controller needs ~105 ms, so
   the driver gives up and powers the controller off (`reset failed` `0xe00002c9`, or `setPowerStateGated ... failed with
