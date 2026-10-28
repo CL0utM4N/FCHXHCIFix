@@ -108,8 +108,7 @@ void FCHXHCIFix::publish(const char *what) {
 // Why it isn't forwarding, on the verbose screen too (the property can't be read during an install).
 void FCHXHCIFix::fail(const char *what) {
 	publish(what);
-	IOLog("FCHXHCIFix: not forwarding: %s
-", what);
+	IOLog("FCHXHCIFix: not forwarding: %s\n", what);
 }
 
 // Collect the driver's filter interrupt sources on the controller, inside the work loop's gate.
@@ -133,8 +132,7 @@ IOReturn FCHXHCIFix::listSources(OSObject *owner, void *arg, void *, void *, voi
 	auto *loop = static_cast<IOWorkLoop *>(arg);
 	for (auto *source = WorkLoopPeek::head(loop); source; source = EventSourcePeek::next(source)) {
 		auto *interrupt = OSDynamicCast(IOInterruptEventSource, source);
-		IOLog("FCHXHCIFix: work loop source %s%s
-", source->getMetaClass()->getClassName(),
+		IOLog("FCHXHCIFix: work loop source %s%s\n", source->getMetaClass()->getClassName(),
 			interrupt ? (interrupt->getProvider() == self->pci ? " (on the controller)" : " (other provider)") : "");
 	}
 	return kIOReturnSuccess;
