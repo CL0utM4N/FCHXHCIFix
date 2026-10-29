@@ -86,9 +86,9 @@ firmware problem that breaks USB in other ways (steps 5 and 6; see *Check your f
    Leave the other keys empty or 0. If your config already has an `SSDT-XOSI` and this rename (common for I²C
    trackpads), keep yours instead.
 6. **Whenever the firmware sees Windows 8 or later** (step 5, or your own `SSDT-XOSI`): also add `SSDT-FCHXHCI.aml`
-   from the zip to `EFI/OC/ACPI` and `config.plist` → ACPI → Add. In that mode the firmware power-gates the USB 3
-   controller in a way macOS can't undo (see *The firmware's xHCI D3cold path* below). It's harmless without such a
-   rename, and does nothing on firmware that doesn't have the flag it clears.
+   from the zip to `EFI/OC/ACPI` and `config.plist` → ACPI → Add. In that mode the firmware power-gates the USB 3 and USB 2
+   controllers in a way macOS can't undo (see *The firmware's xHCI D3cold path* below). It's harmless without such a
+   rename, and does nothing on firmware that doesn't have the flags it clears.
 
 If you install macOS from a USB stick on one of these machines, put it in the EFI from the start: the installer reads
 everything over USB.
@@ -110,6 +110,14 @@ disassemble `DSDT.aml` with `iasl -d DSDT.aml`. In `DSDT.dsl`, look for:
 
 ## Check that it's working
 
+During boot (verbose, `-v`) it prints one of:
+- `FCHXHCIFix: forwarding interrupts to AppleUSBXHCIPCI (1 sources, mode 2)`: it's running.
+- `FCHXHCIFix: not forwarding: <reason>`, sometimes followed by `FCHXHCIFix: work loop source …` lines: it couldn't
+  find Apple's interrupt source. It keeps looking for 5 minutes after Apple's driver starts. If it gives up, open an
+  issue with a photo of those lines.
+
+Once booted:
+
 ```
 ioreg -lw0 -r -c IOPCIDevice | grep FCHXHCIFix-state
 "FCHXHCIFix-state" = "1 sources, 482113 forwards, 482113 polls; running, mode 2 (every poll)"
@@ -127,8 +135,10 @@ ioreg -lw0 -r -c IOPCIDevice | grep FCHXHCIFix-state
 - ASUS VivoBook 15 **D509BA** (A9-9425, Stoney Ridge): installed macOS Ventura 13.7.8, Sonoma 14 and Sequoia 15.8.1, and
   the Sequoia 15.4 recovery and installer. Monterey 12.5.1 needs the reset patch's `Limit` at 2048 (see *Reset timeout*
   below); tested only up to that point so far.
+- Dell **Inspiron 3475** AIO (A6-9225, Stoney Ridge): installed macOS Ventura 13.7.8, every USB port working, with
+  steps 4–6 and the `GHUB` patch from *USB 2 hub port marked "not connectable"* below.
 
-Only the D509BA has been tested so far. The controller, its revision and the APU's interrupt path are the same on all
+The controller, its revision and the APU's interrupt path are the same on all
 of the machines below, so they very likely behave the same. Reports from other machines are welcome: open an issue
 with your model, macOS version and the `FCHXHCIFix-state` line.
 
@@ -248,6 +258,37 @@ These aren't caused by the lost interrupts and FCHXHCIFix doesn't fix them, but 
 
   `Limit` matters: the bytes sit 571 bytes into `reset()` on Sequoia 15.8.1 but 1078 on Monterey 12.5.1, so a limit of
   1024 silently skips Monterey's copy. There is one match in each version, so 2048 can't hit anything else.
+- **USB 2 hub port marked "not connectable".** The FCH's EHCI has one root port, wired to an internal hub (the
+  hub the USB 2 ports, webcam, card reader and so on hang off). Some firmware describes that port (`EHC1.RHUB.GHUB`)
+  with a `_UPC` whose first value is `Zero`, "not connectable". Windows and Linux ignore it, but macOS creates no port
+  for it, so the hub and everything behind it never show up: in `ioreg -lw0 -r -c AppleUSBEHCIPCI` the controller has
+  no `PRT1`, and `ioreg -p IOUSB` shows no EHCI root hub. Found on a Dell Inspiron 3475 AIO. To check, look in
+  `DSDT.dsl` for:
+
+  ```
+  Device (GHUB)
+  {
+      Name (_ADR, One)
+      Name (_UPC, Package (0x04)
+      {
+          Zero,
+          0xFF,
+  ```
+
+  If yours has `Zero` there, an OpenCore DSDT patch makes it `One` (`config.plist` → ACPI → Patch):
+
+  | Key | Value |
+  |---|---|
+  | `Comment` | `EHC1 GHUB _UPC: connectable` |
+  | `Count` | `1` |
+  | `Enabled` | `true` |
+  | `Find` | `47485542085F41445201085F555043120704000AFF0000` (data) |
+  | `Replace` | `47485542085F41445201085F555043120704010AFF0000` (data) |
+  | `TableSignature` | `44534454` (data, `DSDT`) |
+
+  Leave the other keys empty or 0. `Find` is `GHUB`, its `_ADR` and the `_UPC` package, so it can't match anything
+  else. If it doesn't match, your firmware lays the hub out differently: open an issue with your ACPI dump. (The ASUS
+  VivoBook 15 D509BA and Acer Aspire E5-523 already mark it connectable.)
 - **USB map.** As on any machine, map the ports (e.g. with a `USBMap.kext`).
 
 ## Building
