@@ -399,26 +399,53 @@ void FCHHubSleep::checkHub() {
 		perPort ? "per-port power, the webcam's port goes off during sleep" : "no per-port power, left alone");
 }
 
-// Apple's port switches itself: AppleUSBHostPort::setProperties takes "UsbForcePower" (true On, false Off).
+// Apple's port switches itself: AppleUSBHostPort::setProperties takes "UsbForcePower" as an OSNumber (it casts every key
+// to OSNumber and reads this one with unsigned8BitValue: nonzero On, 0 Off). An OSBoolean fails the cast and the call
+// falls through to IOService::setProperties (kIOReturnUnsupported, log 1793715475).
 IOReturn FCHHubSleep::forcePower(IOService *port, bool on) {
 	auto *dict = OSDictionary::withCapacity(1);
-	if (!dict)
-		return kIOReturnNoMemory;
-	dict->setObject("UsbForcePower", on ? kOSBooleanTrue : kOSBooleanFalse);
-	IOReturn ret = port->setProperties(dict);
-	dict->release();
+	auto *value = OSNumber::withNumber(on ? 1ULL : 0ULL, 8);
+	IOReturn ret = kIOReturnNoMemory;
+	if (dict && value) {
+		dict->setObject("UsbForcePower", value);
+		ret = port->setProperties(dict);
+	}
+	if (value)
+		value->release();
+	if (dict)
+		dict->release();
 	return ret;
+}
+
+// A port-statistics count. The property is generated when read (not an OSDictionary in the registry), so it is
+// serialised as ioreg does and the count read from the text: <key>name</key><integer ...>n</integer>.
+static unsigned portStat(IOService *port, const char *key) {
+	unsigned value = 999;
+	auto *obj = port->copyProperty("port-statistics");
+	if (!obj)
+		return value;
+	if (auto *dict = OSDynamicCast(OSDictionary, obj)) {
+		if (auto *num = OSDynamicCast(OSNumber, dict->getObject(key)))
+			value = num->unsigned32BitValue();
+	} else if (auto *s = OSSerialize::withCapacity(4096)) {
+		if (obj->serialize(s)) {
+			char tag[64];
+			snprintf(tag, sizeof(tag), "<key>%s</key>", key);
+			if (const char *at = strstr(s->text(), tag))
+				if ((at = strstr(at + strlen(tag), "<integer")) && (at = strchr(at, '>')))
+					value = static_cast<unsigned>(strtoul(at + 1, nullptr, 0));
+		}
+		s->release();
+	}
+	obj->release();
+	return value;
 }
 
 // Connect and remote-wake counts of every hub port (n:c/w) and of the hub itself on EHC1's root port.
 void FCHHubSleep::logCounts(const char *when) {
 	char line[220];
 	int len = snprintf(line, sizeof(line), "FCHXHCIFix: %s: counts", when);
-	auto count = [](IOService *port, const char *key) -> unsigned {
-		auto *stats = OSDynamicCast(OSDictionary, port->getProperty("port-statistics"));
-		auto *num = stats ? OSDynamicCast(OSNumber, stats->getObject(key)) : nullptr;
-		return num ? num->unsigned32BitValue() : 999;
-	};
+	auto count = portStat;
 	auto add = [&](const char *name, IOService *port) {
 		if (len > 0 && static_cast<size_t>(len) < sizeof(line))
 			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %s:%u/%u", name,
