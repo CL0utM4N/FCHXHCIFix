@@ -46,9 +46,9 @@ $(KEXT)/Contents/Info.plist: Info.plist.in Makefile
 $(BUILD)/%.aml: %.dsl | $(BUILD)
 	iasl -p $(basename $@) $<
 
-$(BUILD)/$(PRODUCT_NAME)-$(MODULE_VERSION).zip: $(BINARY) $(KEXT)/Contents/Info.plist $(BUILD)/SSDT-FCHXHCI.aml \
+$(BUILD)/$(PRODUCT_NAME)-$(MODULE_VERSION).zip: $(BINARY) $(KEXT)/Contents/Info.plist $(BUILD)/SSDT-FCHXHCI.aml $(BUILD)/SSDT-FCHSLEEP.aml \
 		$(BUILD)/SSDT-XOSI.aml
-	cd $(BUILD) && rm -f $(notdir $@) && zip -qr $(notdir $@) $(PRODUCT_NAME).kext SSDT-FCHXHCI.aml SSDT-XOSI.aml
+	cd $(BUILD) && rm -f $(notdir $@) && zip -qr $(notdir $@) $(PRODUCT_NAME).kext SSDT-FCHXHCI.aml SSDT-FCHSLEEP.aml SSDT-XOSI.aml
 
 $(BUILD):
 	@mkdir -p $@
