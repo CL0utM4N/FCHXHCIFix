@@ -11,8 +11,10 @@
  * wake off (_PRW) stops it too, but also stops keyboards on the USB 2 ports waking the machine and USB 2 devices being
  * seen when they're plugged in.
  *
- * This _PTS sets XHCD and EHCD for the length of the firmware's _PTS when macOS enters S3, so FPTS leaves both
- * controllers powered, then puts them back. macOS has already put the controllers in D3 by then (with the flags
+ * This _PTS sets XHCD and EHCD for the length of the firmware's _PTS when macOS enters S3 or S4, so FPTS leaves both
+ * controllers powered, then puts them back. S4 too: macOS's standby ("sleep params ... type 5", straight away with
+ * StandbyNoDelay) prepares S4, and the Dell's second sleep of a boot was such a standby (EHC1 all ones again, woken by
+ * EHC1 at once) while the S3-only first version had covered the first. macOS has already put the controllers in D3 by then (with the flags
  * clear, so _PS3 didn't power-gate them), and they stay armed: a key press on any USB port wakes the machine. On wake
  * FWAK only powers them on again if they were off. Other sleep states and other OSes run the firmware's _PTS as is.
  * Firmware without these flags is left alone (CondRefOf).
@@ -29,7 +31,7 @@ DefinitionBlock ("", "SSDT", 2, "FCHXHC", "FCHSLEEP", 0x00001000)
 
     Method (\_PTS, 1, NotSerialized)  // _PTS: Prepare To Sleep
     {
-        If ((_OSI ("Darwin") && (Arg0 == 0x03)))
+        If ((_OSI ("Darwin") && ((Arg0 == 0x03) || (Arg0 == 0x04))))
         {
             Local0 = Zero
             Local1 = Zero
