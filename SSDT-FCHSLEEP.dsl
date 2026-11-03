@@ -1,6 +1,6 @@
 /*
- * SSDT-FCHSLEEP: keep the AMD FCH's EHCI (USB 2) controller powered through S3/S4 under macOS, so it doesn't wake the
- * machine the moment it goes to sleep.
+ * SSDT-FCHSLEEP: keep the AMD FCH USB controllers powered through S3 under macOS, so EHCI doesn't wake the machine
+ * the moment it goes to sleep.
  *
  * AMD's reference firmware for these APUs prepares sleep in _PTS -> SPTS -> FPTS. For S3 and S4, FPTS powers the FCH's
  * xHCI and EHCI off through FDDC (device 0x17 and 0x12, D3) whenever XHCD / EHCD are clear, which is how
@@ -11,14 +11,17 @@
  * wake off (_PRW) stops it too, but also stops keyboards on the USB 2 ports waking the machine and USB 2 devices being
  * seen when they're plugged in.
  *
- * This _PTS sets EHCD for the length of the firmware's _PTS when macOS enters S3 or S4, so FPTS leaves EHCI powered,
- * then puts it back. macOS has already put the controller in D3 by then (with the flag clear, so _PS3 didn't
- * power-gate it), and it stays armed: a key press on a USB 2 port wakes the machine. On wake FWAK only powers it on
- * again if it was off. S4 too: macOS's standby ("sleep params ... type 5", straight away with StandbyNoDelay) prepares
- * S4, and the Dell's second sleep of a boot was such a standby (EHC1 all ones again, woken by EHC1 at once).
- * The xHCI is left to the firmware: the first version kept it powered too (XHCD as well), and the Dell then woke at once
- * with "Wake reason: ?" instead, with EHC1 quiet (log 1793784140); the xHCI's power-off never woke it before.
- * Other sleep states and other OSes run the firmware's _PTS as is. Firmware without the flag is left alone (CondRefOf).
+ * This _PTS sets XHCD and EHCD for the length of the firmware's _PTS when macOS enters S3 or S4, so FPTS leaves both
+ * controllers powered, then puts them back. S4 too: macOS's standby ("sleep params ... type 5", straight away with
+ * StandbyNoDelay) prepares S4, and the Dell's second sleep of a boot was such a standby (EHC1 all ones again, woken by
+ * EHC1 at once) while the S3-only first version had covered the first. macOS has already put the controllers in D3
+ * by then (with the flags clear, so _PS3 didn't power-gate them), and they stay armed: a key press on any USB port
+ * wakes the machine. On wake FWAK only powers them on again if they were off. Other sleep states and other OSes run
+ * the firmware's _PTS as is. Firmware without these flags is left alone (CondRefOf).
+ *
+ * The Dell then still woke at once with "Wake reason: ?", with EHC1 quiet and also with the xHCI left to the firmware
+ * (GPE 0x16, the Ethernet controller's PCIe port, pending before S3). That isn't the controllers' power: macOS arms
+ * every _PRW device for wake. CarrizoRed's wake filter arms only the USB controllers at S3 entry.
  *
  * Needs the OpenCore ACPI patch renaming only the _PTS definition (DSDT: 5F50545301 -> 5A50545301, "_PTS" with its
  * argument count, Count 1), and SSDT-FCHXHCI (EHCD clear at runtime).
@@ -27,6 +30,7 @@
 DefinitionBlock ("", "SSDT", 2, "FCHXHC", "FCHSLEEP", 0x00001000)
 {
     External (\ZPTS, MethodObj)
+    External (\XHCD, FieldUnitObj)
     External (\EHCD, FieldUnitObj)
 
     Method (\_PTS, 1, NotSerialized)  // _PTS: Prepare To Sleep
@@ -34,16 +38,28 @@ DefinitionBlock ("", "SSDT", 2, "FCHXHC", "FCHSLEEP", 0x00001000)
         If ((_OSI ("Darwin") && ((Arg0 == 0x03) || (Arg0 == 0x04))))
         {
             Local0 = Zero
+            Local1 = Zero
+            If (CondRefOf (\XHCD))
+            {
+                Local0 = \XHCD
+                \XHCD = One
+            }
+
             If (CondRefOf (\EHCD))
             {
-                Local0 = \EHCD
+                Local1 = \EHCD
                 \EHCD = One
             }
 
             \ZPTS (Arg0)
+            If (CondRefOf (\XHCD))
+            {
+                \XHCD = Local0
+            }
+
             If (CondRefOf (\EHCD))
             {
-                \EHCD = Local0
+                \EHCD = Local1
             }
         }
         Else
