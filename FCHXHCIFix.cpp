@@ -432,8 +432,8 @@ static unsigned portStat(IOService *port, const char *key) {
 			char tag[64];
 			snprintf(tag, sizeof(tag), "<key>%s</key>", key);
 			const char *text = s->text(), *end = text + s->getLength();
-			const char *at = strnstr(text, tag, s->getLength());
-			if (at && (at = strnstr(at, "<integer", static_cast<size_t>(end - at)))) {
+			const char *at = strnstr(const_cast<char *>(text), tag, s->getLength());  // xnu: strnstr(char *, ...)
+			if (at && (at = strnstr(const_cast<char *>(at), "<integer", static_cast<size_t>(end - at)))) {
 				while (at < end && *at != '>')
 					at++;
 				if (at < end)
