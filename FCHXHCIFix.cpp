@@ -431,9 +431,14 @@ static unsigned portStat(IOService *port, const char *key) {
 		if (obj->serialize(s)) {
 			char tag[64];
 			snprintf(tag, sizeof(tag), "<key>%s</key>", key);
-			if (const char *at = strstr(s->text(), tag))
-				if ((at = strstr(at + strlen(tag), "<integer")) && (at = strchr(at, '>')))
+			const char *text = s->text(), *end = text + s->getLength();
+			const char *at = strnstr(text, tag, s->getLength());
+			if (at && (at = strnstr(at, "<integer", static_cast<size_t>(end - at)))) {
+				while (at < end && *at != '>')
+					at++;
+				if (at < end)
 					value = static_cast<unsigned>(strtoul(at + 1, nullptr, 0));
+			}
 		}
 		s->release();
 	}
