@@ -278,13 +278,17 @@ done:
 //  (_PRW) stops it but also stops the keyboard waking the machine and USB 2 devices being seen when plugged in.
 //
 //  This attaches to the hub's IOUSBHostDevice in its own IOMatchCategory, next to AppleUSB20Hub. Before sleep it
-//  switches off power to the hub ports whose device has a video-class (0x0E) interface (ClearPortFeature PORT_POWER), so
-//  nothing changes on the hub during S3, and switches them on again on wake, when the camera enumerates as it does
-//  after every wake anyway. The hub stays armed for wake: keyboards and mice on its ports still wake the machine. Only
-//  when the hub switches port power per port (wHubCharacteristics bits 1:0 = 01); a hub that switches all ports together
-//  is left alone. The requests go to the hub's default endpoint on behalf of AppleUSB20Hub's session (the device allows
-//  one client session; its work loop serialises the requests with the hub driver's own).
-//  State in the hub's "FCHXHCIFix-sleep" property and the kernel log ("FCHXHCIFix: hub ...").
+//  switches off the hub ports whose device has a video-class (0x0E) interface, so nothing changes on the hub during S3,
+//  and switches them on again on wake, when the camera enumerates as it does after every wake anyway. The hub stays
+//  armed for wake: keyboards and mice on its ports still wake the machine. Only when the hub switches port power per
+//  port (wHubCharacteristics bits 1:0 = 01, read from the hub's default endpoint on behalf of AppleUSB20Hub's session:
+//  the device allows one client session); a hub that switches all ports together is left alone.
+//  The port is switched through Apple's own port object: its "UsbForcePower" property (AppleUSBHostPort::setProperties
+//  calls forcePower(on ? 3 : 0, 1000 ms)). The first version sent ClearPortFeature(PORT_POWER) behind AppleUSB20Hub's
+//  back at "will sleep"; EHC1 still woke the Dell at once, probably because the hub driver restored the port in the
+//  ~60 s before S3 (Tahoe's apps take the full 30 s to agree to sleep).
+//  Each sleep and wake logs every hub port's connect and remote-wake counts and the hub's own (on EHC1's root port), so
+//  a wake that still happens names its port. State in the hub's "FCHXHCIFix-sleep" property and the kernel log.
 //
 //  Boot-arg: -fchcamwake   leave the webcam's port powered during sleep
 //
@@ -302,13 +306,17 @@ private:
 	void checkHub();
 	void cameraPortsOff();
 	void portsOn(const char *why);
+	void logCounts(const char *when);
+	static IOReturn forcePower(IOService *port, bool on);
 	void publish(const char *what);
 
 	IOUSBHostDevice *hub {nullptr};
 	IONotifier *notifier {nullptr};
 	int perPort {-1};  // -1 not read yet, 0 ganged or no switching, 1 per-port power switching
 	uint8_t ports {0};
-	uint32_t offMask {0}, sleeps {0}, offs {0};
+	uint32_t sleeps {0}, offs {0};
+	IOService *offPorts[8] {};
+	uint8_t offCount {0};
 };
 
 OSDefineMetaClassAndStructors(FCHHubSleep, IOService)
@@ -391,6 +399,47 @@ void FCHHubSleep::checkHub() {
 		perPort ? "per-port power, the webcam's port goes off during sleep" : "no per-port power, left alone");
 }
 
+// Apple's port switches itself: AppleUSBHostPort::setProperties takes "UsbForcePower" (true On, false Off).
+IOReturn FCHHubSleep::forcePower(IOService *port, bool on) {
+	auto *dict = OSDictionary::withCapacity(1);
+	if (!dict)
+		return kIOReturnNoMemory;
+	dict->setObject("UsbForcePower", on ? kOSBooleanTrue : kOSBooleanFalse);
+	IOReturn ret = port->setProperties(dict);
+	dict->release();
+	return ret;
+}
+
+// Connect and remote-wake counts of every hub port (n:c/w) and of the hub itself on EHC1's root port.
+void FCHHubSleep::logCounts(const char *when) {
+	char line[220];
+	int len = snprintf(line, sizeof(line), "FCHXHCIFix: %s: counts", when);
+	auto count = [](IOService *port, const char *key) -> unsigned {
+		auto *stats = OSDynamicCast(OSDictionary, port->getProperty("port-statistics"));
+		auto *num = stats ? OSDynamicCast(OSNumber, stats->getObject(key)) : nullptr;
+		return num ? num->unsigned32BitValue() : 999;
+	};
+	auto add = [&](const char *name, IOService *port) {
+		if (len > 0 && static_cast<size_t>(len) < sizeof(line))
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %s:%u/%u", name,
+				count(port, "kPortStatConnectCount"), count(port, "kPortStatRemoteWakeCount"));
+	};
+	if (auto *root = OSDynamicCast(IOService, hub->getProvider()))
+		add("hub", root);
+	auto *driver = hubDriver();
+	if (auto *iter = driver ? driver->getChildIterator(gIOServicePlane) : nullptr) {
+		while (auto *port = OSDynamicCast(IOService, iter->getNextObject())) {
+			auto *num = OSDynamicCast(OSData, port->getProperty("port"));
+			char name[4];
+			snprintf(name, sizeof(name), "%u",
+				num && num->getLength() ? *static_cast<const uint8_t *>(num->getBytesNoCopy()) : 0);
+			add(name, port);
+		}
+		iter->release();
+	}
+	IOLog("%s (connects/remote wakes)\n", line);
+}
+
 void FCHHubSleep::cameraPortsOff() {
 	auto *driver = hubDriver();
 	auto *portIter = driver ? driver->getChildIterator(gIOServicePlane) : nullptr;
@@ -398,7 +447,7 @@ void FCHHubSleep::cameraPortsOff() {
 		return;
 	while (auto *port = OSDynamicCast(IOService, portIter->getNextObject())) {
 		auto *num = OSDynamicCast(OSData, port->getProperty("port"));
-		if (!num || num->getLength() < 1)
+		if (!num || num->getLength() < 1 || offCount >= sizeof(offPorts) / sizeof(offPorts[0]))
 			continue;
 		uint8_t n = *static_cast<const uint8_t *>(num->getBytesNoCopy());
 		bool camera = false;
@@ -414,12 +463,13 @@ void FCHHubSleep::cameraPortsOff() {
 			}
 			devIter->release();
 		}
-		if (!camera || n < 1 || n > 31)
+		if (!camera)
 			continue;
-		IOReturn ret = hubRequest(0x23, 1, 8, n, nullptr, 0);  // ClearPortFeature(PORT_POWER)
+		IOReturn ret = forcePower(port, false);
 		IOLog("FCHXHCIFix: sleep: webcam on hub port %u, power off: %x\n", n, ret);
 		if (ret == kIOReturnSuccess) {
-			offMask |= 1U << n;
+			port->retain();
+			offPorts[offCount++] = port;
 			offs++;
 		}
 	}
@@ -427,15 +477,16 @@ void FCHHubSleep::cameraPortsOff() {
 }
 
 void FCHHubSleep::portsOn(const char *why) {
-	for (uint8_t n = 1; n < 32 && offMask; n++) {
-		if (!(offMask & (1U << n)))
-			continue;
-		IOReturn ret = hubRequest(0x23, 3, 8, n, nullptr, 0);  // SetPortFeature(PORT_POWER)
-		uint8_t status[4] {};
-		hubRequest(0xA3, 0, 0, n, status, sizeof(status));     // GetPortStatus: bit 8 PORT_POWER
-		IOLog("FCHXHCIFix: %s: hub port %u power on: %x, status %02x%02x\n", why, n, ret, status[1], status[0]);
-		offMask &= ~(1U << n);
+	for (uint8_t i = 0; i < offCount; i++) {
+		auto *port = offPorts[i];
+		auto *num = OSDynamicCast(OSData, port->getProperty("port"));
+		IOReturn ret = forcePower(port, true);
+		IOLog("FCHXHCIFix: %s: hub port %u power on: %x\n", why,
+			num && num->getLength() ? *static_cast<const uint8_t *>(num->getBytesNoCopy()) : 0, ret);
+		port->release();
+		offPorts[i] = nullptr;
 	}
+	offCount = 0;
 }
 
 IOReturn FCHHubSleep::powerMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
@@ -445,6 +496,7 @@ IOReturn FCHHubSleep::powerMessage(void *target, void *, UInt32 type, IOService 
 			self->sleeps++;
 			if (self->perPort < 0)
 				self->checkHub();
+			self->logCounts("sleep");
 			if (self->perPort == 1)
 				self->cameraPortsOff();
 			self->publish("asleep");
@@ -454,6 +506,7 @@ IOReturn FCHHubSleep::powerMessage(void *target, void *, UInt32 type, IOService 
 			self->publish("awake");
 			break;
 		case kIOMessageSystemHasPoweredOn:
+			self->logCounts("wake");
 			self->portsOn("wake");
 			self->publish("awake");
 			break;
