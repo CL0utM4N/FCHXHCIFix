@@ -317,6 +317,9 @@ private:
 	uint32_t sleeps {0}, offs {0};
 	IOService *offPorts[8] {};
 	uint8_t offCount {0};
+	// fchhuboff=<mask> (test): also power off these hub ports during sleep (bit n = port n), whatever is on them,
+	// to find which device wakes the machine as it enters S3.
+	uint32_t extraOff {0};
 };
 
 OSDefineMetaClassAndStructors(FCHHubSleep, IOService)
@@ -328,6 +331,8 @@ bool FCHHubSleep::start(IOService *provider) {
 	hub = OSDynamicCast(IOUSBHostDevice, provider);
 	if (!hub || !IOService::start(provider))
 		return false;
+	if (!PE_parse_boot_argn("fchhuboff", &extraOff, sizeof(extraOff)))
+		extraOff = 0;
 	hub->retain();
 	if (auto *root = getPMRootDomain())
 		notifier = root->registerInterest(gIOGeneralInterest, powerMessage, this);
@@ -495,10 +500,11 @@ void FCHHubSleep::cameraPortsOff() {
 			}
 			devIter->release();
 		}
-		if (!camera)
+		bool extra = n < 32 && (extraOff & (1U << n));
+		if (!camera && !extra)
 			continue;
 		IOReturn ret = forcePower(port, false);
-		IOLog("FCHXHCIFix: sleep: webcam on hub port %u, power off: %x\n", n, ret);
+		IOLog("FCHXHCIFix: sleep: %s on hub port %u, power off: %x\n", camera ? "webcam" : "fchhuboff", n, ret);
 		if (ret == kIOReturnSuccess) {
 			port->retain();
 			offPorts[offCount++] = port;
