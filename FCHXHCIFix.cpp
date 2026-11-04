@@ -298,6 +298,13 @@ done:
 //  Boot-arg (test): fchehciwakeclr=<mask>  clear these wake enables on every root port before D3 (1 connect,
 //  2 disconnect, 4 over-current)
 //
+//  That log showed macOS leaves the EHCI running into D3: USBCMD Run/Stop and both schedules on, the hub's root port
+//  enabled and not suspended (Tahoe, log 1793803595). The hub then loses its bus without a suspend, and the FCH takes
+//  that as a wake as the machine enters S3 (back after ~1 s, every sleep). So before D3 each enabled root port is
+//  suspended (PORTSC Suspend; the hub and its devices go to USB suspend, from which a key press is a remote wake), then
+//  the controller is halted, as an EHCI driver does for system sleep. The firmware resets the controller on resume and
+//  macOS starts it again. Boot-arg: -fchnoehcisuspend leaves it running.
+//
 class FCHHubSleep : public IOService {
 	OSDeclareDefaultStructors(FCHHubSleep)
 
@@ -336,6 +343,7 @@ private:
 	IOMemoryMap *ehciMap {nullptr};
 	bool ehciInterest {false};
 	uint32_t wakeClear {0};
+	bool suspendOff {false};
 };
 
 OSDefineMetaClassAndStructors(FCHHubSleep, IOService)
@@ -351,6 +359,7 @@ bool FCHHubSleep::start(IOService *provider) {
 		extraOff = 0;
 	if (!PE_parse_boot_argn("fchehciwakeclr", &wakeClear, sizeof(wakeClear)))
 		wakeClear = 0;
+	suspendOff = PE_parse_boot_argn("-fchnoehcisuspend", arg, sizeof(arg));
 	for (IOService *p = provider->getProvider(); p && !ehci; p = p->getProvider())
 		ehci = OSDynamicCast(IOPCIDevice, p);
 	if (ehci && ehci->configRead8(kIOPCIConfigClassCode) == 0x20) {
@@ -603,6 +612,34 @@ void FCHHubSleep::rootPortsSleep() {
 			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " -> %x", after);
 	}
 	IOLog("FCHXHCIFix: EHCI before D3: %s\n", line);
+	if (suspendOff)
+		return;
+	auto *usbcmd = reinterpret_cast<volatile uint32_t *>(op);
+	auto *usbsts = reinterpret_cast<volatile uint32_t *>(op + 4);
+	uint32_t suspended = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		auto *portsc = reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i);
+		uint32_t v = *portsc;
+		// connected, enabled, not suspended, not owned by a companion controller
+		if ((v & 0x1) && (v & 0x4) && !(v & 0x80) && !(v & 0x2000)) {
+			*portsc = (v & ~0x2AU) | 0x80;
+			suspended |= 1U << i;
+		}
+	}
+	if (suspended)
+		IOSleep(5);
+	bool wasRunning = *usbcmd & 1;
+	if (wasRunning) {
+		*usbcmd = *usbcmd & ~1U;
+		for (int t = 0; t < 200 && !(*usbsts & 0x1000); t++)
+			IODelay(100);
+	}
+	len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x", *usbcmd, *usbsts);
+	for (uint32_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
+		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x", i + 1,
+			*reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i));
+	IOLog("FCHXHCIFix: EHCI suspended for sleep (ports %x suspended, %s): %s\n", suspended,
+		wasRunning ? ((*usbsts & 0x1000) ? "halted" : "halt timed out") : "was halted", line);
 }
 
 IOReturn FCHHubSleep::powerMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
