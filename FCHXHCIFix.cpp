@@ -343,6 +343,12 @@ private:
 	void rootPortsWake();
 	uint32_t suspendedPorts {0};
 	IOPCIDevice *ehci {nullptr};
+	// The FCH's xHCI (1022:7914): its ports' wake enables before D3 (a keyboard on a USB 3 port never woke the Dell
+	// with GPE 0x19 armed). PORTSC: CCS 0, PED 1, PLS 8:5, PP 9, speed 13:10, WCE 25, WDE 26, WOE 27.
+	IOPCIDevice *xhci {nullptr};
+	IOMemoryMap *xhciMap {nullptr};
+	bool xhciInterest {false};
+	void xhciPortsLog(const char *when);
 	IOMemoryMap *ehciMap {nullptr};
 	bool ehciInterest {false};
 	uint32_t wakeClear {0};
@@ -375,6 +381,18 @@ bool FCHHubSleep::start(IOService *provider) {
 	} else {
 		ehci = nullptr;
 	}
+	if (auto *pcis = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"))) {
+		while (auto *pci = OSDynamicCast(IOPCIDevice, pcis->getNextObject()))
+			if (!xhci && pci->configRead16(kIOPCIConfigVendorID) == 0x1022 && pci->configRead8(kIOPCIConfigClassCode + 2) == 0x0C &&
+				pci->configRead8(kIOPCIConfigClassCode + 1) == 0x03 && pci->configRead8(kIOPCIConfigClassCode) == 0x30)
+				xhci = pci;
+		if (xhci) {
+			xhci->retain();
+			xhciMap = xhci->mapDeviceMemoryWithIndex(0);
+			xhciInterest = xhciMap && xhci->registerInterestedDriver(this) != 0xFFFFFFFF;
+		}
+		pcis->release();
+	}
 	hub->retain();
 	if (auto *root = getPMRootDomain())
 		notifier = root->registerInterest(gIOGeneralInterest, powerMessage, this);
@@ -383,6 +401,13 @@ bool FCHHubSleep::start(IOService *provider) {
 }
 
 void FCHHubSleep::stop(IOService *provider) {
+	if (xhci) {
+		if (xhciInterest)
+			xhci->deRegisterInterestedDriver(this);
+		OSSafeReleaseNULL(xhciMap);
+		xhci->release();
+		xhci = nullptr;
+	}
 	if (ehci) {
 		if (ehciInterest)
 			ehci->deRegisterInterestedDriver(this);
@@ -583,6 +608,8 @@ void FCHHubSleep::portsOn(const char *why) {
 IOReturn FCHHubSleep::powerStateWillChangeTo(IOPMPowerFlags, unsigned long stateNumber, IOService *whatDevice) {
 	if (whatDevice == ehci && stateNumber < 2)
 		rootPortsSleep();
+	if (whatDevice == xhci && stateNumber < 2)
+		xhciPortsLog("before D3");
 	return kIOPMAckImplied;
 }
 
@@ -655,6 +682,31 @@ void FCHHubSleep::rootPortsWake() {
 //      the bus switches over to full-speed idle";
 //   4. 150 us, halt, and leave the port change interrupt enabled (remote wakeup).
 // fchehciwakeclr=<mask> (test) then clears wake enables (1 connect, 2 disconnect, 4 over-current).
+void FCHHubSleep::xhciPortsLog(const char *when) {
+	if (!xhciMap)
+		return;
+	auto *base = reinterpret_cast<volatile uint8_t *>(xhciMap->getVirtualAddress());
+	uint32_t length = static_cast<uint32_t>(xhciMap->getLength());
+	uint8_t capLength = base[0];
+	uint32_t hcs1 = *reinterpret_cast<volatile uint32_t *>(base + 4);
+	uint32_t n = hcs1 >> 24;
+	auto *op = base + capLength;
+	if (capLength < 0x20 || hcs1 == 0xFFFFFFFF || n > 16 || capLength + 0x400U + 0x10 * n > length) {
+		IOLog("FCHXHCIFix: xHCI %s: registers not readable (caplength %x, HCSPARAMS1 %x)\n", when, capLength, hcs1);
+		return;
+	}
+	char line[400];
+	int len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x", *reinterpret_cast<volatile uint32_t *>(op),
+		*reinterpret_cast<volatile uint32_t *>(op + 4));
+	for (uint32_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++) {
+		uint32_t v = *reinterpret_cast<volatile uint32_t *>(op + 0x400 + 0x10 * i);
+		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; %u %x%s PLS %u%s%s%s", i + 1, v,
+			(v & 1) ? " dev" : "", (v >> 5) & 0xF, (v & (1U << 25)) ? " WCE" : "", (v & (1U << 26)) ? " WDE" : "",
+			(v & (1U << 27)) ? " WOE" : "");
+	}
+	IOLog("FCHXHCIFix: xHCI %s: %s\n", when, line);
+}
+
 void FCHHubSleep::rootPortsSleep() {
 	if (!ehciMap)
 		return;
