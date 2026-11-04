@@ -583,6 +583,16 @@ IOReturn FCHHubSleep::powerStateWillChangeTo(IOPMPowerFlags, unsigned long state
 	return kIOPMAckImplied;
 }
 
+// Linux's ehci_bus_suspend (drivers/usb/host/ehci-hub.c), which macOS doesn't do for this controller: it leaves the
+// EHCI running into D3, with the hub's root port enabled and armed for wake on *connect* (log 1793803595). In order:
+//   1. stop the schedules (ehci_quiesce: clear ASE/PSE, wait for the status bits);
+//   2. suspend every enabled port, and set the wake enables by what's on the port: a connected port wakes on
+//      over-current and disconnect, never on connect; an empty port on over-current and connect. Linux: "only enable
+//      appropriate wake bits, otherwise the hardware can not go phy low power mode";
+//   3. 5 ms when a high-speed port got wake-on-disconnect: "some controllers ... generate false wakeup signals until
+//      the bus switches over to full-speed idle";
+//   4. 150 us, halt, and leave the port change interrupt enabled (remote wakeup).
+// fchehciwakeclr=<mask> (test) then clears wake enables (1 connect, 2 disconnect, 4 over-current).
 void FCHHubSleep::rootPortsSleep() {
 	if (!ehciMap)
 		return;
@@ -596,53 +606,73 @@ void FCHHubSleep::rootPortsSleep() {
 		IOLog("FCHXHCIFix: EHCI before D3: registers not readable (caplength %x, HCSPARAMS %x)\n", capLength, hcs);
 		return;
 	}
-	uint32_t clr = ((wakeClear & 1) ? (1U << 20) : 0) | ((wakeClear & 2) ? (1U << 21) : 0) | ((wakeClear & 4) ? (1U << 22) : 0);
-	char line[200];
-	int len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x CONFIGFLAG %x", *reinterpret_cast<volatile uint32_t *>(op),
-		*reinterpret_cast<volatile uint32_t *>(op + 4), *reinterpret_cast<volatile uint32_t *>(op + 0x40));
-	for (uint32_t i = 0; i < n; i++) {
-		auto *portsc = reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i);
-		uint32_t v = *portsc, after = v;
-		if (clr && (v & clr)) {
-			*portsc = v & ~clr & ~0x2AU;  // 0x2A: write-1-to-clear change bits, left alone
-			after = *portsc;
-		}
-		if (len >= 0 && static_cast<size_t>(len) < sizeof(line))
-			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x (wake on%s%s%s)%s", i + 1, v,
-				(v & (1U << 20)) ? " connect" : "", (v & (1U << 21)) ? " disconnect" : "", (v & (1U << 22)) ? " over-current" : "",
-				"");
-		if (after != v && len >= 0 && static_cast<size_t>(len) < sizeof(line))
-			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " -> %x", after);
+	auto *usbcmd = reinterpret_cast<volatile uint32_t *>(op);
+	auto *usbsts = reinterpret_cast<volatile uint32_t *>(op + 4);
+	auto *usbintr = reinterpret_cast<volatile uint32_t *>(op + 8);
+	auto portsc = [&](uint32_t i) { return reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i); };
+	constexpr uint32_t RWC = 0x2A, PE = 1U << 2, RESUME = 1U << 6, SUSP = 1U << 7, OWNER = 1U << 13;
+	constexpr uint32_t WKCONN = 1U << 20, WKDISC = 1U << 21, WKOC = 1U << 22, WAKE = WKCONN | WKDISC | WKOC;
+
+	char line[240];
+	int len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x USBINTR %x", *usbcmd, *usbsts, *usbintr);
+	for (uint32_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++) {
+		uint32_t v = *portsc(i);
+		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x (wake on%s%s%s)", i + 1, v,
+			(v & WKCONN) ? " connect" : "", (v & WKDISC) ? " disconnect" : "", (v & WKOC) ? " over-current" : "");
 	}
 	IOLog("FCHXHCIFix: EHCI before D3: %s\n", line);
 	if (suspendOff)
 		return;
-	auto *usbcmd = reinterpret_cast<volatile uint32_t *>(op);
-	auto *usbsts = reinterpret_cast<volatile uint32_t *>(op + 4);
-	uint32_t suspended = 0;
+
+	// 1. quiesce
+	uint32_t cmd = *usbcmd;
+	if (cmd & 0x30) {
+		*usbcmd = cmd & ~0x30U;
+		for (int t = 0; t < 200 && (*usbsts & 0xC000); t++)
+			IODelay(100);
+	}
+	// 2. suspend and arm
+	uint32_t suspended = 0, resuming = 0;
+	bool fsIdleDelay = false;
+	uint32_t clr = ((wakeClear & 1) ? WKCONN : 0) | ((wakeClear & 2) ? WKDISC : 0) | ((wakeClear & 4) ? WKOC : 0);
 	for (uint32_t i = 0; i < n; i++) {
-		auto *portsc = reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i);
-		uint32_t v = *portsc;
-		// connected, enabled, not suspended, not owned by a companion controller
-		if ((v & 0x1) && (v & 0x4) && !(v & 0x80) && !(v & 0x2000)) {
-			*portsc = (v & ~0x2AU) | 0x80;
+		uint32_t t1 = *portsc(i) & ~RWC;
+		uint32_t t2 = t1 & ~WAKE;
+		if (t1 & RESUME)
+			resuming |= 1U << i;
+		if (!(t1 & OWNER) && (t1 & PE) && !(t1 & SUSP)) {
+			t2 |= SUSP;
 			suspended |= 1U << i;
 		}
+		t2 |= (t1 & 1) ? (WKOC | WKDISC) : (WKOC | WKCONN);
+		t2 &= ~clr;
+		if (t1 != t2) {
+			// high speed: enabled and line status not K (bits 10-11), the EHCI port owns it
+			if ((t2 & WKDISC) && (t1 & PE) && !(t1 & OWNER))
+				fsIdleDelay = true;
+			*portsc(i) = t2;
+		}
 	}
+	// 3.
+	if (fsIdleDelay)
+		IOSleep(6);
+	// 4.
 	if (suspended)
-		IOSleep(5);
+		IODelay(150);
 	bool wasRunning = *usbcmd & 1;
 	if (wasRunning) {
 		*usbcmd = *usbcmd & ~1U;
 		for (int t = 0; t < 200 && !(*usbsts & 0x1000); t++)
 			IODelay(100);
 	}
-	len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x", *usbcmd, *usbsts);
+	*usbintr = 0x37;  // INTR_MASK: INT, ERR, PCD, FATAL, IAA
+
+	len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x USBINTR %x", *usbcmd, *usbsts, *usbintr);
 	for (uint32_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
-		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x", i + 1,
-			*reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i));
-	IOLog("FCHXHCIFix: EHCI suspended for sleep (ports %x suspended, %s): %s\n", suspended,
-		wasRunning ? ((*usbsts & 0x1000) ? "halted" : "halt timed out") : "was halted", line);
+		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x", i + 1, *portsc(i));
+	IOLog("FCHXHCIFix: EHCI suspended the Linux way (ports %x suspended, %x were resuming, %s%s): %s\n", suspended,
+		resuming, wasRunning ? ((*usbsts & 0x1000) ? "halted" : "halt timed out") : "was halted",
+		fsIdleDelay ? ", 6 ms full-speed idle wait" : "", line);
 }
 
 IOReturn FCHHubSleep::powerMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
