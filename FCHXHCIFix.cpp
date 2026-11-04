@@ -292,6 +292,12 @@ done:
 //
 //  Boot-arg: -fchcamwake   leave the webcam's port powered during sleep
 //
+//  The EHCI's root ports: just before the controller leaves D0 for sleep, its PORTSC registers are logged with their
+//  wake enables (WKCNNT_E bit 20, WKDSCNNT_E 21, WKOC_E 22): the Dell still woke at once with every hub port powered
+//  off (log 1793802647), so the wake is the hub's own root port or the empty one.
+//  Boot-arg (test): fchehciwakeclr=<mask>  clear these wake enables on every root port before D3 (1 connect,
+//  2 disconnect, 4 over-current)
+//
 class FCHHubSleep : public IOService {
 	OSDeclareDefaultStructors(FCHHubSleep)
 
@@ -320,6 +326,16 @@ private:
 	// fchhuboff=<mask> (test): also power off these hub ports during sleep (bit n = port n), whatever is on them,
 	// to find which device wakes the machine as it enters S3.
 	uint32_t extraOff {0};
+
+public:
+	IOReturn powerStateWillChangeTo(IOPMPowerFlags capabilities, unsigned long stateNumber, IOService *whatDevice) override;
+
+private:
+	void rootPortsSleep();
+	IOPCIDevice *ehci {nullptr};
+	IOMemoryMap *ehciMap {nullptr};
+	bool ehciInterest {false};
+	uint32_t wakeClear {0};
 };
 
 OSDefineMetaClassAndStructors(FCHHubSleep, IOService)
@@ -333,6 +349,19 @@ bool FCHHubSleep::start(IOService *provider) {
 		return false;
 	if (!PE_parse_boot_argn("fchhuboff", &extraOff, sizeof(extraOff)))
 		extraOff = 0;
+	if (!PE_parse_boot_argn("fchehciwakeclr", &wakeClear, sizeof(wakeClear)))
+		wakeClear = 0;
+	for (IOService *p = provider->getProvider(); p && !ehci; p = p->getProvider())
+		ehci = OSDynamicCast(IOPCIDevice, p);
+	if (ehci && ehci->configRead8(kIOPCIConfigClassCode) == 0x20) {
+		ehci->retain();
+		ehciMap = ehci->mapDeviceMemoryWithIndex(0);
+		ehciInterest = ehciMap && ehci->registerInterestedDriver(this) != 0xFFFFFFFF;
+		IOLog("FCHXHCIFix: EHCI %s, root port wake log %s, wake enables cleared before D3: %x\n", ehci->getName(),
+			ehciInterest ? "on" : "off", wakeClear);
+	} else {
+		ehci = nullptr;
+	}
 	hub->retain();
 	if (auto *root = getPMRootDomain())
 		notifier = root->registerInterest(gIOGeneralInterest, powerMessage, this);
@@ -341,6 +370,13 @@ bool FCHHubSleep::start(IOService *provider) {
 }
 
 void FCHHubSleep::stop(IOService *provider) {
+	if (ehci) {
+		if (ehciInterest)
+			ehci->deRegisterInterestedDriver(this);
+		OSSafeReleaseNULL(ehciMap);
+		ehci->release();
+		ehci = nullptr;
+	}
 	if (notifier) {
 		notifier->remove();
 		notifier = nullptr;
@@ -525,6 +561,48 @@ void FCHHubSleep::portsOn(const char *why) {
 		offPorts[i] = nullptr;
 	}
 	offCount = 0;
+}
+
+// IOPCIDevice power states: 0 off, 1 doze, 2 on, 3 paused. Called before the device's own change, so before
+// IOPCIDevice writes PMCSR (D3), with the controller already suspended by its driver and its registers readable.
+IOReturn FCHHubSleep::powerStateWillChangeTo(IOPMPowerFlags, unsigned long stateNumber, IOService *whatDevice) {
+	if (whatDevice == ehci && stateNumber < 2)
+		rootPortsSleep();
+	return kIOPMAckImplied;
+}
+
+void FCHHubSleep::rootPortsSleep() {
+	if (!ehciMap)
+		return;
+	auto *base = reinterpret_cast<volatile uint8_t *>(ehciMap->getVirtualAddress());
+	uint32_t length = static_cast<uint32_t>(ehciMap->getLength());
+	uint8_t capLength = base[0];
+	uint32_t hcs = *reinterpret_cast<volatile uint32_t *>(base + 4);
+	uint32_t n = hcs & 0xF;
+	auto *op = base + capLength;
+	if (capLength < 0x10 || capLength + 0x44U + 4 * n > length || hcs == 0xFFFFFFFF) {
+		IOLog("FCHXHCIFix: EHCI before D3: registers not readable (caplength %x, HCSPARAMS %x)\n", capLength, hcs);
+		return;
+	}
+	uint32_t clr = ((wakeClear & 1) ? (1U << 20) : 0) | ((wakeClear & 2) ? (1U << 21) : 0) | ((wakeClear & 4) ? (1U << 22) : 0);
+	char line[200];
+	int len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x CONFIGFLAG %x", *reinterpret_cast<volatile uint32_t *>(op),
+		*reinterpret_cast<volatile uint32_t *>(op + 4), *reinterpret_cast<volatile uint32_t *>(op + 0x40));
+	for (uint32_t i = 0; i < n; i++) {
+		auto *portsc = reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i);
+		uint32_t v = *portsc, after = v;
+		if (clr && (v & clr)) {
+			*portsc = v & ~clr & ~0x2AU;  // 0x2A: write-1-to-clear change bits, left alone
+			after = *portsc;
+		}
+		if (len >= 0 && static_cast<size_t>(len) < sizeof(line))
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x (wake on%s%s%s)%s", i + 1, v,
+				(v & (1U << 20)) ? " connect" : "", (v & (1U << 21)) ? " disconnect" : "", (v & (1U << 22)) ? " over-current" : "",
+				"");
+		if (after != v && len >= 0 && static_cast<size_t>(len) < sizeof(line))
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " -> %x", after);
+	}
+	IOLog("FCHXHCIFix: EHCI before D3: %s\n", line);
 }
 
 IOReturn FCHHubSleep::powerMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
