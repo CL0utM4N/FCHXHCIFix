@@ -336,9 +336,12 @@ private:
 
 public:
 	IOReturn powerStateWillChangeTo(IOPMPowerFlags capabilities, unsigned long stateNumber, IOService *whatDevice) override;
+	IOReturn powerStateDidChangeTo(IOPMPowerFlags capabilities, unsigned long stateNumber, IOService *whatDevice) override;
 
 private:
 	void rootPortsSleep();
+	void rootPortsWake();
+	uint32_t suspendedPorts {0};
 	IOPCIDevice *ehci {nullptr};
 	IOMemoryMap *ehciMap {nullptr};
 	bool ehciInterest {false};
@@ -583,6 +586,65 @@ IOReturn FCHHubSleep::powerStateWillChangeTo(IOPMPowerFlags, unsigned long state
 	return kIOPMAckImplied;
 }
 
+// After the PCI device is back in D0 and before the EHCI driver runs again (children power up after their parent).
+IOReturn FCHHubSleep::powerStateDidChangeTo(IOPMPowerFlags, unsigned long stateNumber, IOService *whatDevice) {
+	if (whatDevice == ehci && stateNumber >= 2)
+		rootPortsWake();
+	return kIOPMAckImplied;
+}
+
+// Linux's ehci_bus_resume for the ports rootPortsSleep suspended: the controller running (SOFs, no schedules), Force
+// Port Resume for 40 ms (USB_RESUME_TIMEOUT), then clear Resume and Suspend and the wake enables. Without it macOS
+// found the hub's root port still suspended after the wake and the USB 2 devices were gone (log 1793806578).
+void FCHHubSleep::rootPortsWake() {
+	uint32_t ports = suspendedPorts;
+	suspendedPorts = 0;
+	if (!ports || !ehciMap)
+		return;
+	auto *base = reinterpret_cast<volatile uint8_t *>(ehciMap->getVirtualAddress());
+	uint32_t length = static_cast<uint32_t>(ehciMap->getLength());
+	uint8_t capLength = base[0];
+	uint32_t hcs = *reinterpret_cast<volatile uint32_t *>(base + 4);
+	uint32_t n = hcs & 0xF;
+	auto *op = base + capLength;
+	if (capLength < 0x10 || capLength + 0x44U + 4 * n > length || hcs == 0xFFFFFFFF) {
+		IOLog("FCHXHCIFix: EHCI after wake: registers not readable (caplength %x, HCSPARAMS %x)\n", capLength, hcs);
+		return;
+	}
+	auto *usbcmd = reinterpret_cast<volatile uint32_t *>(op);
+	auto *usbsts = reinterpret_cast<volatile uint32_t *>(op + 4);
+	auto portsc = [&](uint32_t i) { return reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i); };
+	constexpr uint32_t RWC = 0x2A, RESUME = 1U << 6, SUSP = 1U << 7, WAKE = 7U << 20;
+	uint32_t cmdBefore = *usbcmd, before[4] {}, resumed = 0;
+	for (uint32_t i = 0; i < n && i < 4; i++)
+		before[i] = *portsc(i);
+	if (!(cmdBefore & 1)) {
+		*usbcmd = (cmdBefore & ~0x30U) | 1;
+		for (int t = 0; t < 200 && (*usbsts & 0x1000); t++)
+			IODelay(100);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t t = *portsc(i) & ~(RWC | WAKE);
+		if ((ports & (1U << i)) && (t & SUSP)) {
+			t |= RESUME;
+			resumed |= 1U << i;
+		}
+		*portsc(i) = t;
+	}
+	if (resumed) {
+		IOSleep(40);
+		for (uint32_t i = 0; i < n; i++)
+			if (resumed & (1U << i))
+				*portsc(i) = *portsc(i) & ~(RWC | RESUME | SUSP);
+		IOSleep(5);
+	}
+	char line[200];
+	int len = snprintf(line, sizeof(line), "USBCMD %x -> %x", cmdBefore, *usbcmd);
+	for (uint32_t i = 0; i < n && i < 4 && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
+		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x -> %x", i + 1, before[i], *portsc(i));
+	IOLog("FCHXHCIFix: EHCI resumed the Linux way (ports %x resumed): %s\n", resumed, line);
+}
+
 // Linux's ehci_bus_suspend (drivers/usb/host/ehci-hub.c), which macOS doesn't do for this controller: it leaves the
 // EHCI running into D3, with the hub's root port enabled and armed for wake on *connect* (log 1793803595). In order:
 //   1. stop the schedules (ehci_quiesce: clear ASE/PSE, wait for the status bits);
@@ -666,6 +728,7 @@ void FCHHubSleep::rootPortsSleep() {
 			IODelay(100);
 	}
 	*usbintr = 0x37;  // INTR_MASK: INT, ERR, PCD, FATAL, IAA
+	suspendedPorts |= suspended;
 
 	len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x USBINTR %x", *usbcmd, *usbsts, *usbintr);
 	for (uint32_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
