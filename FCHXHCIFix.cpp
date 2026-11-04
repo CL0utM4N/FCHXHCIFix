@@ -343,14 +343,14 @@ private:
 	IOMemoryMap *ehciMap {nullptr};
 	bool ehciInterest {false};
 	uint32_t wakeClear {0};
-	bool suspendOff {false};
+	bool suspendOff {false}, cameraOn {false};
 };
 
 OSDefineMetaClassAndStructors(FCHHubSleep, IOService)
 
 bool FCHHubSleep::start(IOService *provider) {
 	char arg[8];
-	if (PE_parse_boot_argn("-fchxhcioff", arg, sizeof(arg)) || PE_parse_boot_argn("-fchcamwake", arg, sizeof(arg)))
+	if (PE_parse_boot_argn("-fchxhcioff", arg, sizeof(arg)))
 		return false;
 	hub = OSDynamicCast(IOUSBHostDevice, provider);
 	if (!hub || !IOService::start(provider))
@@ -360,6 +360,7 @@ bool FCHHubSleep::start(IOService *provider) {
 	if (!PE_parse_boot_argn("fchehciwakeclr", &wakeClear, sizeof(wakeClear)))
 		wakeClear = 0;
 	suspendOff = PE_parse_boot_argn("-fchnoehcisuspend", arg, sizeof(arg));
+	cameraOn = PE_parse_boot_argn("-fchcamwake", arg, sizeof(arg));
 	for (IOService *p = provider->getProvider(); p && !ehci; p = p->getProvider())
 		ehci = OSDynamicCast(IOPCIDevice, p);
 	if (ehci && ehci->configRead8(kIOPCIConfigClassCode) == 0x20) {
@@ -546,6 +547,8 @@ void FCHHubSleep::cameraPortsOff() {
 			devIter->release();
 		}
 		bool extra = n < 32 && (extraOff & (1U << n));
+		if (cameraOn)
+			camera = false;
 		if (!camera && !extra)
 			continue;
 		IOReturn ret = forcePower(port, false);
