@@ -1,16 +1,19 @@
-USB 2 fixes for more firmware, `SSDT-XOSI.aml` in the zip, and on-screen status from the kext.
+Sleep: these machines now stay in S3 and wake from USB keyboards on both the USB 2 and the USB 3 ports.
 
-- **`SSDT-FCHXHCI` now also clears `EHCD`,** the USB 2 (EHCI) twin of the USB 3 D3cold flag. In Windows 8+ mode the
-  firmware power-gated the EHCI controller in a way macOS can't undo (dead USB 2 ports on a Dell Inspiron 3475 AIO).
-  Replace your `SSDT-FCHXHCI.aml` with the one in this zip.
-- **New in the README: *USB 2 hub port marked "not connectable"*.** Some firmware marks the EHCI port that the internal
-  hub hangs off as not connectable, so macOS never sees the hub or anything behind it. The README shows how to check
-  your DSDT and gives a one-byte OpenCore ACPI patch (needed on the Dell Inspiron 3475).
-- **New: `SSDT-XOSI.aml`** and *Check your firmware*. AMD's reference firmware turns the HPET off unless it sees
-  Windows Vista or later. The symptoms are a dead or flaky keyboard and USB, or a boot that only continues once a USB
-  device is plugged in. Install steps 5 and 6 cover it.
-- **The kext prints its status on the verbose boot screen:** `forwarding interrupts …`, or `not forwarding: <reason>`.
-  It now keeps looking for Apple's interrupt source for 5 minutes instead of 5 seconds, for slower start-ups.
-- Still required: the `AppleUSBXHCI::reset()` kernel patch (Install step 4, `Limit` 2048).
-- Tested: ASUS VivoBook 15 D509BA (A9-9425; Ventura 13.7.8, Sonoma 14, Sequoia 15.8.1) and Dell Inspiron 3475 AIO
-  (A6-9225; Ventura 13.7.8, every USB port working).
+Under macOS, Carrizo/Bristol Ridge/Stoney machines woke ~1 s after every S3 entry, and USB 3 keyboards couldn't wake
+them. With this release and [CarrizoRed](https://github.com/CL0utM4N/CarrizoRed) 0.2.0 they sleep properly
+(see *Sleep* in the README).
+
+- **New: `SSDT-FCHSLEEP.aml`** (Install step 7, with a one-entry `_PTS` → `ZPTS` OpenCore patch). AMD's reference
+  firmware powers the USB 2 controller (EHCI) off in `_PTS` while it is armed for wake, which wakes the machine at
+  once. The SSDT keeps EHCI powered through `_PTS` and leaves the USB 3 controller to the firmware's own sleep
+  hand-over, which is what lets USB 3 keyboards wake the machine.
+- **New: the webcam's port on the internal USB 2 hub is switched off during sleep** and back on after the wake (the
+  webcam loses power in S3, which the hub took as a reason to wake). `-fchcamwake` leaves it on.
+- **Remove `SSDT-GPRW`** (or any `_PRW` override for `EHC1`/`XHC0`) if you added one to stop instant wakes: it isn't
+  needed with this, and it stops USB keyboards waking the machine.
+- The rest of the sleep fixes (CPU cache flush before S3, wake source filtering, the FCH's USB wake quirks) are in
+  CarrizoRed 0.2.0. Without CarrizoRed, sleep on these machines isn't expected to work.
+- Still required for USB 3: the `AppleUSBXHCI::reset()` kernel patch (Install step 4, `Limit` 2048).
+- Tested: Dell Inspiron 3475 AIO (A6-9225, Tahoe) and ASUS VivoBook 15 D509BA (A9-9425): real S3, no wakes of its own,
+  wake from USB 2 and USB 3 keyboards, every port working after the wake.

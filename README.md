@@ -150,7 +150,8 @@ ioreg -lw0 -r -c IOPCIDevice | grep FCHXHCIFix-state
 
 - ASUS VivoBook 15 **D509BA** (A9-9425, Stoney Ridge): installed macOS Ventura 13.7.8, Sonoma 14 and Sequoia 15.8.1, and
   the Sequoia 15.4 recovery and installer. Monterey 12.5.1 needs the reset patch's `Limit` at 2048 (see *Reset timeout*
-  below); tested only up to that point so far.
+  below); tested only up to that point so far. Sleep and wake from USB keyboards with step 7 and CarrizoRed (see
+  *Sleep*).
 - Dell **Inspiron 3475** AIO (A6-9225, Stoney Ridge): installed macOS Ventura 13.7.8, every USB port working, with
   steps 4–6 and the `GHUB` patch from *USB 2 hub port marked "not connectable"* below. Tahoe: sleep and wake from USB 2
   and USB 3 keyboards with step 7 and CarrizoRed (see *Sleep*).
