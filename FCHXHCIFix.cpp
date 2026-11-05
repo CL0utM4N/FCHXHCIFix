@@ -292,18 +292,10 @@ done:
 //
 //  Boot-arg: -fchcamwake   leave the webcam's port powered during sleep
 //
-//  The EHCI's root ports: just before the controller leaves D0 for sleep, its PORTSC registers are logged with their
-//  wake enables (WKCNNT_E bit 20, WKDSCNNT_E 21, WKOC_E 22): the Dell still woke at once with every hub port powered
-//  off (log 1793802647), so the wake is the hub's own root port or the empty one.
-//  Boot-arg (test): fchehciwakeclr=<mask>  clear these wake enables on every root port before D3 (1 connect,
-//  2 disconnect, 4 over-current)
-//
-//  That log showed macOS leaves the EHCI running into D3: USBCMD Run/Stop and both schedules on, the hub's root port
-//  enabled and not suspended (Tahoe, log 1793803595). The hub then loses its bus without a suspend, and the FCH takes
-//  that as a wake as the machine enters S3 (back after ~1 s, every sleep). So before D3 each enabled root port is
-//  suspended (PORTSC Suspend; the hub and its devices go to USB suspend, from which a key press is a remote wake), then
-//  the controller is halted, as an EHCI driver does for system sleep. The firmware resets the controller on resume and
-//  macOS starts it again. Boot-arg: -fchnoehcisuspend leaves it running.
+//  The rest of what sleep needs on these machines is elsewhere: SSDT-FCHSLEEP keeps EHCI powered through _PTS, and
+//  CarrizoRed clears the hub's wake on connect/disconnect/over-current (EHCI config 0x84) and filters the wake GPEs at
+//  S3 entry. Suspending and halting the EHCI before D3 the way Linux does was tried here and broke USB 2 after the wake
+//  (a hub request timed out); macOS's own EHCI handling works once the hub's wake enables are right.
 //
 class FCHHubSleep : public IOService {
 	OSDeclareDefaultStructors(FCHHubSleep)
@@ -330,29 +322,7 @@ private:
 	uint32_t sleeps {0}, offs {0};
 	IOService *offPorts[8] {};
 	uint8_t offCount {0};
-	// fchhuboff=<mask> (test): also power off these hub ports during sleep (bit n = port n), whatever is on them,
-	// to find which device wakes the machine as it enters S3.
-	uint32_t extraOff {0};
-
-public:
-	IOReturn powerStateWillChangeTo(IOPMPowerFlags capabilities, unsigned long stateNumber, IOService *whatDevice) override;
-	IOReturn powerStateDidChangeTo(IOPMPowerFlags capabilities, unsigned long stateNumber, IOService *whatDevice) override;
-
-private:
-	void rootPortsSleep();
-	void rootPortsWake();
-	uint32_t suspendedPorts {0};
-	IOPCIDevice *ehci {nullptr};
-	// The FCH's xHCI (1022:7914): its ports' wake enables before D3 (a keyboard on a USB 3 port never woke the Dell
-	// with GPE 0x19 armed). PORTSC: CCS 0, PED 1, PLS 8:5, PP 9, speed 13:10, WCE 25, WDE 26, WOE 27.
-	IOPCIDevice *xhci {nullptr};
-	IOMemoryMap *xhciMap {nullptr};
-	bool xhciInterest {false};
-	void xhciPortsLog(const char *when);
-	IOMemoryMap *ehciMap {nullptr};
-	bool ehciInterest {false};
-	uint32_t wakeClear {0};
-	bool suspendOff {false}, cameraOn {false};
+	bool cameraOn {false};
 };
 
 OSDefineMetaClassAndStructors(FCHHubSleep, IOService)
@@ -364,35 +334,7 @@ bool FCHHubSleep::start(IOService *provider) {
 	hub = OSDynamicCast(IOUSBHostDevice, provider);
 	if (!hub || !IOService::start(provider))
 		return false;
-	if (!PE_parse_boot_argn("fchhuboff", &extraOff, sizeof(extraOff)))
-		extraOff = 0;
-	if (!PE_parse_boot_argn("fchehciwakeclr", &wakeClear, sizeof(wakeClear)))
-		wakeClear = 0;
-	suspendOff = PE_parse_boot_argn("-fchnoehcisuspend", arg, sizeof(arg));
 	cameraOn = PE_parse_boot_argn("-fchcamwake", arg, sizeof(arg));
-	for (IOService *p = provider->getProvider(); p && !ehci; p = p->getProvider())
-		ehci = OSDynamicCast(IOPCIDevice, p);
-	if (ehci && ehci->configRead8(kIOPCIConfigClassCode) == 0x20) {
-		ehci->retain();
-		ehciMap = ehci->mapDeviceMemoryWithIndex(0);
-		ehciInterest = ehciMap && ehci->registerInterestedDriver(this) != 0xFFFFFFFF;
-		IOLog("FCHXHCIFix: EHCI %s, root port wake log %s, wake enables cleared before D3: %x\n", ehci->getName(),
-			ehciInterest ? "on" : "off", wakeClear);
-	} else {
-		ehci = nullptr;
-	}
-	if (auto *pcis = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"))) {
-		while (auto *pci = OSDynamicCast(IOPCIDevice, pcis->getNextObject()))
-			if (!xhci && pci->configRead16(kIOPCIConfigVendorID) == 0x1022 && pci->configRead8(kIOPCIConfigClassCode + 2) == 0x0C &&
-				pci->configRead8(kIOPCIConfigClassCode + 1) == 0x03 && pci->configRead8(kIOPCIConfigClassCode) == 0x30)
-				xhci = pci;
-		if (xhci) {
-			xhci->retain();
-			xhciMap = xhci->mapDeviceMemoryWithIndex(0);
-			xhciInterest = xhciMap && xhci->registerInterestedDriver(this) != 0xFFFFFFFF;
-		}
-		pcis->release();
-	}
 	hub->retain();
 	if (auto *root = getPMRootDomain())
 		notifier = root->registerInterest(gIOGeneralInterest, powerMessage, this);
@@ -401,20 +343,6 @@ bool FCHHubSleep::start(IOService *provider) {
 }
 
 void FCHHubSleep::stop(IOService *provider) {
-	if (xhci) {
-		if (xhciInterest)
-			xhci->deRegisterInterestedDriver(this);
-		OSSafeReleaseNULL(xhciMap);
-		xhci->release();
-		xhci = nullptr;
-	}
-	if (ehci) {
-		if (ehciInterest)
-			ehci->deRegisterInterestedDriver(this);
-		OSSafeReleaseNULL(ehciMap);
-		ehci->release();
-		ehci = nullptr;
-	}
 	if (notifier) {
 		notifier->remove();
 		notifier = nullptr;
@@ -574,13 +502,10 @@ void FCHHubSleep::cameraPortsOff() {
 			}
 			devIter->release();
 		}
-		bool extra = n < 32 && (extraOff & (1U << n));
-		if (cameraOn)
-			camera = false;
-		if (!camera && !extra)
+		if (!camera || cameraOn)
 			continue;
 		IOReturn ret = forcePower(port, false);
-		IOLog("FCHXHCIFix: sleep: %s on hub port %u, power off: %x\n", camera ? "webcam" : "fchhuboff", n, ret);
+		IOLog("FCHXHCIFix: sleep: webcam on hub port %u, power off: %x\n", n, ret);
 		if (ret == kIOReturnSuccess) {
 			port->retain();
 			offPorts[offCount++] = port;
@@ -601,193 +526,6 @@ void FCHHubSleep::portsOn(const char *why) {
 		offPorts[i] = nullptr;
 	}
 	offCount = 0;
-}
-
-// IOPCIDevice power states: 0 off, 1 doze, 2 on, 3 paused. Called before the device's own change, so before
-// IOPCIDevice writes PMCSR (D3), with the controller already suspended by its driver and its registers readable.
-IOReturn FCHHubSleep::powerStateWillChangeTo(IOPMPowerFlags, unsigned long stateNumber, IOService *whatDevice) {
-	if (whatDevice == ehci && stateNumber < 2)
-		rootPortsSleep();
-	if (whatDevice == xhci && stateNumber < 2)
-		xhciPortsLog("before D3");
-	return kIOPMAckImplied;
-}
-
-// After the PCI device is back in D0 and before the EHCI driver runs again (children power up after their parent).
-IOReturn FCHHubSleep::powerStateDidChangeTo(IOPMPowerFlags, unsigned long stateNumber, IOService *whatDevice) {
-	if (whatDevice == ehci && stateNumber >= 2)
-		rootPortsWake();
-	return kIOPMAckImplied;
-}
-
-// Linux's ehci_bus_resume for the ports rootPortsSleep suspended: the controller running (SOFs, no schedules), Force
-// Port Resume for 40 ms (USB_RESUME_TIMEOUT), then clear Resume and Suspend and the wake enables. Without it macOS
-// found the hub's root port still suspended after the wake and the USB 2 devices were gone (log 1793806578).
-void FCHHubSleep::rootPortsWake() {
-	uint32_t ports = suspendedPorts;
-	suspendedPorts = 0;
-	if (!ports || !ehciMap)
-		return;
-	auto *base = reinterpret_cast<volatile uint8_t *>(ehciMap->getVirtualAddress());
-	uint32_t length = static_cast<uint32_t>(ehciMap->getLength());
-	uint8_t capLength = base[0];
-	uint32_t hcs = *reinterpret_cast<volatile uint32_t *>(base + 4);
-	uint32_t n = hcs & 0xF;
-	auto *op = base + capLength;
-	if (capLength < 0x10 || capLength + 0x44U + 4 * n > length || hcs == 0xFFFFFFFF) {
-		IOLog("FCHXHCIFix: EHCI after wake: registers not readable (caplength %x, HCSPARAMS %x)\n", capLength, hcs);
-		return;
-	}
-	auto *usbcmd = reinterpret_cast<volatile uint32_t *>(op);
-	auto *usbsts = reinterpret_cast<volatile uint32_t *>(op + 4);
-	auto portsc = [&](uint32_t i) { return reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i); };
-	constexpr uint32_t RWC = 0x2A, RESUME = 1U << 6, SUSP = 1U << 7, WAKE = 7U << 20;
-	uint32_t cmdBefore = *usbcmd, before[4] {}, resumed = 0;
-	for (uint32_t i = 0; i < n && i < 4; i++)
-		before[i] = *portsc(i);
-	if (!(cmdBefore & 1)) {
-		*usbcmd = (cmdBefore & ~0x30U) | 1;
-		for (int t = 0; t < 200 && (*usbsts & 0x1000); t++)
-			IODelay(100);
-	}
-	for (uint32_t i = 0; i < n; i++) {
-		uint32_t t = *portsc(i) & ~(RWC | WAKE);
-		if ((ports & (1U << i)) && (t & SUSP)) {
-			t |= RESUME;
-			resumed |= 1U << i;
-		}
-		*portsc(i) = t;
-	}
-	if (resumed) {
-		IOSleep(40);
-		for (uint32_t i = 0; i < n; i++)
-			if (resumed & (1U << i))
-				*portsc(i) = *portsc(i) & ~(RWC | RESUME | SUSP);
-		IOSleep(5);
-	}
-	char line[200];
-	int len = snprintf(line, sizeof(line), "USBCMD %x -> %x", cmdBefore, *usbcmd);
-	for (uint32_t i = 0; i < n && i < 4 && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
-		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x -> %x", i + 1, before[i], *portsc(i));
-	IOLog("FCHXHCIFix: EHCI resumed the Linux way (ports %x resumed): %s\n", resumed, line);
-}
-
-// Linux's ehci_bus_suspend (drivers/usb/host/ehci-hub.c), which macOS doesn't do for this controller: it leaves the
-// EHCI running into D3, with the hub's root port enabled and armed for wake on *connect* (log 1793803595). In order:
-//   1. stop the schedules (ehci_quiesce: clear ASE/PSE, wait for the status bits);
-//   2. suspend every enabled port, and set the wake enables by what's on the port: a connected port wakes on
-//      over-current and disconnect, never on connect; an empty port on over-current and connect. Linux: "only enable
-//      appropriate wake bits, otherwise the hardware can not go phy low power mode";
-//   3. 5 ms when a high-speed port got wake-on-disconnect: "some controllers ... generate false wakeup signals until
-//      the bus switches over to full-speed idle";
-//   4. 150 us, halt, and leave the port change interrupt enabled (remote wakeup).
-// fchehciwakeclr=<mask> (test) then clears wake enables (1 connect, 2 disconnect, 4 over-current).
-void FCHHubSleep::xhciPortsLog(const char *when) {
-	if (!xhciMap)
-		return;
-	auto *base = reinterpret_cast<volatile uint8_t *>(xhciMap->getVirtualAddress());
-	uint32_t length = static_cast<uint32_t>(xhciMap->getLength());
-	uint8_t capLength = base[0];
-	uint32_t hcs1 = *reinterpret_cast<volatile uint32_t *>(base + 4);
-	uint32_t n = hcs1 >> 24;
-	auto *op = base + capLength;
-	if (capLength < 0x20 || hcs1 == 0xFFFFFFFF || n > 16 || capLength + 0x400U + 0x10 * n > length) {
-		IOLog("FCHXHCIFix: xHCI %s: registers not readable (caplength %x, HCSPARAMS1 %x)\n", when, capLength, hcs1);
-		return;
-	}
-	char line[400];
-	int len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x", *reinterpret_cast<volatile uint32_t *>(op),
-		*reinterpret_cast<volatile uint32_t *>(op + 4));
-	for (uint32_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++) {
-		uint32_t v = *reinterpret_cast<volatile uint32_t *>(op + 0x400 + 0x10 * i);
-		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; %u %x%s PLS %u%s%s%s", i + 1, v,
-			(v & 1) ? " dev" : "", (v >> 5) & 0xF, (v & (1U << 25)) ? " WCE" : "", (v & (1U << 26)) ? " WDE" : "",
-			(v & (1U << 27)) ? " WOE" : "");
-	}
-	IOLog("FCHXHCIFix: xHCI %s: %s\n", when, line);
-}
-
-void FCHHubSleep::rootPortsSleep() {
-	if (!ehciMap)
-		return;
-	auto *base = reinterpret_cast<volatile uint8_t *>(ehciMap->getVirtualAddress());
-	uint32_t length = static_cast<uint32_t>(ehciMap->getLength());
-	uint8_t capLength = base[0];
-	uint32_t hcs = *reinterpret_cast<volatile uint32_t *>(base + 4);
-	uint32_t n = hcs & 0xF;
-	auto *op = base + capLength;
-	if (capLength < 0x10 || capLength + 0x44U + 4 * n > length || hcs == 0xFFFFFFFF) {
-		IOLog("FCHXHCIFix: EHCI before D3: registers not readable (caplength %x, HCSPARAMS %x)\n", capLength, hcs);
-		return;
-	}
-	auto *usbcmd = reinterpret_cast<volatile uint32_t *>(op);
-	auto *usbsts = reinterpret_cast<volatile uint32_t *>(op + 4);
-	auto *usbintr = reinterpret_cast<volatile uint32_t *>(op + 8);
-	auto portsc = [&](uint32_t i) { return reinterpret_cast<volatile uint32_t *>(op + 0x44 + 4 * i); };
-	constexpr uint32_t RWC = 0x2A, PE = 1U << 2, RESUME = 1U << 6, SUSP = 1U << 7, OWNER = 1U << 13;
-	constexpr uint32_t WKCONN = 1U << 20, WKDISC = 1U << 21, WKOC = 1U << 22, WAKE = WKCONN | WKDISC | WKOC;
-
-	char line[240];
-	int len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x USBINTR %x", *usbcmd, *usbsts, *usbintr);
-	for (uint32_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++) {
-		uint32_t v = *portsc(i);
-		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x (wake on%s%s%s)", i + 1, v,
-			(v & WKCONN) ? " connect" : "", (v & WKDISC) ? " disconnect" : "", (v & WKOC) ? " over-current" : "");
-	}
-	IOLog("FCHXHCIFix: EHCI before D3: %s\n", line);
-	if (suspendOff)
-		return;
-
-	// 1. quiesce
-	uint32_t cmd = *usbcmd;
-	if (cmd & 0x30) {
-		*usbcmd = cmd & ~0x30U;
-		for (int t = 0; t < 200 && (*usbsts & 0xC000); t++)
-			IODelay(100);
-	}
-	// 2. suspend and arm
-	uint32_t suspended = 0, resuming = 0;
-	bool fsIdleDelay = false;
-	uint32_t clr = ((wakeClear & 1) ? WKCONN : 0) | ((wakeClear & 2) ? WKDISC : 0) | ((wakeClear & 4) ? WKOC : 0);
-	for (uint32_t i = 0; i < n; i++) {
-		uint32_t t1 = *portsc(i) & ~RWC;
-		uint32_t t2 = t1 & ~WAKE;
-		if (t1 & RESUME)
-			resuming |= 1U << i;
-		if (!(t1 & OWNER) && (t1 & PE) && !(t1 & SUSP)) {
-			t2 |= SUSP;
-			suspended |= 1U << i;
-		}
-		t2 |= (t1 & 1) ? (WKOC | WKDISC) : (WKOC | WKCONN);
-		t2 &= ~clr;
-		if (t1 != t2) {
-			// high speed: enabled and line status not K (bits 10-11), the EHCI port owns it
-			if ((t2 & WKDISC) && (t1 & PE) && !(t1 & OWNER))
-				fsIdleDelay = true;
-			*portsc(i) = t2;
-		}
-	}
-	// 3.
-	if (fsIdleDelay)
-		IOSleep(6);
-	// 4.
-	if (suspended)
-		IODelay(150);
-	bool wasRunning = *usbcmd & 1;
-	if (wasRunning) {
-		*usbcmd = *usbcmd & ~1U;
-		for (int t = 0; t < 200 && !(*usbsts & 0x1000); t++)
-			IODelay(100);
-	}
-	*usbintr = 0x37;  // INTR_MASK: INT, ERR, PCD, FATAL, IAA
-	suspendedPorts |= suspended;
-
-	len = snprintf(line, sizeof(line), "USBCMD %x USBSTS %x USBINTR %x", *usbcmd, *usbsts, *usbintr);
-	for (uint32_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
-		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), "; port %u %x", i + 1, *portsc(i));
-	IOLog("FCHXHCIFix: EHCI suspended the Linux way (ports %x suspended, %x were resuming, %s%s): %s\n", suspended,
-		resuming, wasRunning ? ((*usbsts & 0x1000) ? "halted" : "halt timed out") : "was halted",
-		fsIdleDelay ? ", 6 ms full-speed idle wait" : "", line);
 }
 
 IOReturn FCHHubSleep::powerMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {

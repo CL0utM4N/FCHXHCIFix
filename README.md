@@ -12,7 +12,8 @@ transfer can wait up to 2 seconds:
 
 FCHXHCIFix wakes Apple's USB interrupt handler itself every ~2.5 ms. With it, USB runs at normal speed.
 
-It's a plain IOKit kext. It needs no Lilu or other dependencies, and it only attaches to `1022:7914`.
+It's a plain IOKit kext. It needs no Lilu or other dependencies. It attaches to `1022:7914`, and for sleep to the
+FCH's internal USB 2 hub (`0438:7900`); see *Sleep*.
 
 It was found and written while bringing up [**CarrizoRed**](https://github.com/CL0utM4N/CarrizoRed), a driver in development that makes Apple's AMD Polaris
 graphics drivers work on these APUs. FCHXHCIFix doesn't depend on CarrizoRed, and it's useful on any of these machines
@@ -89,6 +90,21 @@ firmware problem that breaks USB in other ways (steps 5 and 6; see *Check your f
    from the zip to `EFI/OC/ACPI` and `config.plist` → ACPI → Add. In that mode the firmware power-gates the USB 3 and USB 2
    controllers in a way macOS can't undo (see *The firmware's xHCI D3cold path* below). It's harmless without such a
    rename, and does nothing on firmware that doesn't have the flags it clears.
+7. **For sleep:** add `SSDT-FCHSLEEP.aml` from the zip to `EFI/OC/ACPI` and `config.plist` → ACPI → Add, and this
+   rename to `config.plist` → ACPI → Patch (it renames only the firmware's `_PTS` definition, so the SSDT's `_PTS` runs
+   and calls it):
+
+   | Key | Value |
+   |---|---|
+   | `Comment` | `_PTS to ZPTS (definition only, for SSDT-FCHSLEEP)` |
+   | `Count` | `1` |
+   | `Enabled` | `true` |
+   | `Find` | `5F50545301` (data, `_PTS` with its argument count) |
+   | `Replace` | `5A50545301` (data, `ZPTS`) |
+   | `TableSignature` | `44534454` (data, `DSDT`) |
+
+   Remove any `SSDT-GPRW` or other `_PRW` override for the USB controllers (`EHC1`, `XHC0`): it isn't needed with this
+   and stops USB keyboards waking the machine. See *Sleep* below; most of the sleep fixes live in CarrizoRed.
 
 If you install macOS from a USB stick on one of these machines, put it in the EFI from the start: the installer reads
 everything over USB.
@@ -136,7 +152,8 @@ ioreg -lw0 -r -c IOPCIDevice | grep FCHXHCIFix-state
   the Sequoia 15.4 recovery and installer. Monterey 12.5.1 needs the reset patch's `Limit` at 2048 (see *Reset timeout*
   below); tested only up to that point so far.
 - Dell **Inspiron 3475** AIO (A6-9225, Stoney Ridge): installed macOS Ventura 13.7.8, every USB port working, with
-  steps 4–6 and the `GHUB` patch from *USB 2 hub port marked "not connectable"* below.
+  steps 4–6 and the `GHUB` patch from *USB 2 hub port marked "not connectable"* below. Tahoe: sleep and wake from USB 2
+  and USB 3 keyboards with step 7 and CarrizoRed (see *Sleep*).
 
 The controller, its revision and the APU's interrupt path are the same on all
 of the machines below, so they very likely behave the same. Reports from other machines are welcome: open an issue
@@ -224,7 +241,32 @@ idle states, which may cost some battery life until the root cause is found.
 **Limitations:**
 - Interrupt latency is up to ~2.5 ms instead of microseconds. Fine for storage and input. Audio interfaces and webcams
   on this controller are untested.
-- It doesn't fix sleep or wake, if those have their own problems on these machines.
+- Sleep needs more than this kext; see *Sleep*.
+
+## Sleep
+
+Under macOS these machines woke ~1 s after every S3 entry, and USB 3 keyboards couldn't wake them. Found and fixed on
+a Dell Inspiron 3475 (Tahoe): with the setup below it stays in S3 and wakes only from a key press on a USB 2 or USB 3
+port (or the power button), with every port working after the wake.
+
+What FCHXHCIFix contributes:
+- **`SSDT-FCHSLEEP`** (Install step 7). AMD's reference firmware powers the USB 2 controller (EHCI) off in `_PTS`
+  while it is armed for wake, and losing power wakes the machine at once. The SSDT keeps EHCI powered through `_PTS`
+  (`EHCD` set for its length) and leaves the USB 3 controller to the firmware, whose `_PTS` hands it to the FCH for
+  sleep (save, SMI) and reloads it on wake. Skipping that hand-over (an earlier version did) leaves USB 3 keyboards
+  unable to wake the machine.
+- **The webcam's hub port off during sleep.** The webcam behind the FCH's internal USB 2 hub (`0438:7900`) loses
+  power in S3; the kext switches its hub port off before sleep and on again after the wake (`FCHHubSleep`, attached
+  to the hub). `-fchcamwake` leaves it on.
+
+The rest is in [CarrizoRed](https://github.com/CL0utM4N/CarrizoRed) (on by default; details in its `docs/SLEEP.md`):
+a CPU cache flush before S3 (without it the wake can hang), only the USB controllers, lid and power button armed for
+wake, the wake lines of the FCH's absent USB controllers moved off the shared GPE, EHCI sleeping in D2 (AMD's EHCI
+doesn't signal wake properly from D3), and the internal hub's wake on connect/disconnect/over-current turned off (wake
+on a device's remote wake stays). Without CarrizoRed, sleep on these machines isn't expected to work.
+
+To check: `pmset -g log | grep -i "wake reason"` should name `EHC1` (USB 2) or `XHC0` (USB 3) only after you pressed
+a key.
 
 ## Other USB problems on these machines
 
