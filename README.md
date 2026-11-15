@@ -15,6 +15,9 @@ FCHXHCIFix wakes Apple's USB interrupt handler itself every ~2.5 ms. With it, US
 It's a plain IOKit kext. It needs no Lilu or other dependencies. It attaches to `1022:7914`, and for sleep to the
 FCH's internal USB 2 hub (`0438:7900`); see *Sleep*.
 
+The older FCH xHCI of the Kaveri desktop chipsets and Kabini/Mullins APUs (`1022:7814`) is being tested; it isn't
+matched by default yet. See *Older FCH: `1022:7814`* below.
+
 It was found and written while bringing up [**CarrizoRed**](https://github.com/CL0utM4N/CarrizoRed), a driver in development that makes Apple's AMD Polaris
 graphics drivers work on these APUs. FCHXHCIFix doesn't depend on CarrizoRed, and it's useful on any of these machines
 running macOS, whatever graphics setup they use.
@@ -155,6 +158,10 @@ ioreg -lw0 -r -c IOPCIDevice | grep FCHXHCIFix-state
 - Dell **Inspiron 3475** AIO (A6-9225, Stoney Ridge): installed macOS Ventura 13.7.8, every USB port working, with
   steps 4–6 and the `GHUB` patch from *USB 2 hub port marked "not connectable"* below. Tahoe: sleep and wake from USB 2
   and USB 3 keyboards with step 7 and CarrizoRed (see *Sleep*).
+
+- MSI **A78M-E35 V2** desktop (A6-7400K, Kaveri; FCH xHCI `1022:7814`), in progress: with the match extended to
+  `7814`, it forwarded interrupts on both controllers and the Monterey 12.7 installer booted from a USB stick on the xHCI.
+  See *Older FCH: `1022:7814`*.
 
 The controller, its revision and the APU's interrupt path are the same on all
 of the machines below, so they very likely behave the same. Reports from other machines are welcome: open an issue
@@ -333,6 +340,38 @@ These aren't caused by the lost interrupts and FCHXHCIFix doesn't fix them, but 
   else. If it doesn't match, your firmware lays the hub out differently: open an issue with your ACPI dump. (The ASUS
   VivoBook 15 D509BA and Acer Aspire E5-523 already mark it connectable.)
 - **USB map.** As on any machine, map the ports (e.g. with a `USBMap.kext`).
+
+## Older FCH: `1022:7814` (Kaveri, Kabini, Mullins)
+
+The FCH generation before Carrizo's has its own xHCI, `1022:7814` (revision `0x09`). It is in the A55/A68H/A78/A88X
+chipsets ("Bolton") of FM2/FM2+ desktops with Kaveri, Godavari, Trinity or Richland APUs, and on the die of the
+Kabini/Mullins/Beema APUs. Unlike `7914`, it sits next to full USB 2 and USB 1.1 controllers: EHCI `1022:7808` with OHCI
+companions `1022:7807`, plus OHCI `1022:7809`.
+
+FCHXHCIFix doesn't match `7814` by default, because it isn't known yet whether this controller loses its interrupts
+too. To try it, add `0x78141022` to the `FCHXHCIFix` personality's `IOPCIPrimaryMatch` in the kext's `Info.plist`
+(`0x79141022 0x78141022`). Leave the `FCHHubSleep` personality alone.
+
+Measured on an MSI **A78M-E35 V2** (MS-7721, AMI BIOS V6.5, A6-7400K Kaveri), Monterey 12.7 installer, with the match
+extended and the reset-timeout patch:
+- **Two xHCI controllers** (`00:10.0`, `00:10.1`). FCHXHCIFix forwarded interrupts on both, and a USB 3 stick on a blue
+  port booted the installer. The stick connected at 480 Mbps on an `AppleUSB20XHCIPort`, so SuperSpeed hasn't been seen
+  working yet. Still to test: the same machine without FCHXHCIFix (are the interrupts lost?) and without the reset
+  patch.
+- **HPET:** the same firmware rule as on the Carrizo/Stoney machines (`HPET._STA` needs `OSVR >= 0x0C`), so Install
+  step 5 (`SSDT-XOSI` and the `_OSI` rename) applies. This firmware has no `XHCD`/`EHCD` flags: `SSDT-FCHXHCI` does nothing
+  here.
+- **USB 2 ports, low speed:** work. A USB mouse (1.5 Mbps) was handed from EHCI to its OHCI companion and enumerated on
+  an `AppleUSBOHCIPort`.
+- **USB 2 ports, full speed: a USB keyboard doesn't work.** The EHCI port never hands it to OHCI:
+  `AppleUSBEHCIPort@53300000: AppleUSBHostPort::disconnect: persistent enumeration failures`. Linux uses the same
+  ports with the keyboard on the OHCI companion. Linux also applies AMD's EHCI "dummy qh" workaround to these
+  controllers ("SB700/SB800/Hudson-2/3"), which macOS lacks; whether that is related is open. Workarounds for now: a
+  USB 2 hub between the device and the port (it keeps the device on EHCI), or a blue USB 3 port.
+- No `_UPC` in the DSDT, so macOS has no port types until the ports are mapped.
+
+Linux reference data for the board (`lspci`, ACPI tables, `dmesg`) is in the CarrizoRed (UnifiedRed) project's test
+notes.
 
 ## Building
 
